@@ -32,6 +32,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Enable Long Paths
+        run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+        shell: powershell
+
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.4.1
         env:
@@ -47,6 +51,10 @@ jobs:
           # macOS x86_64 runners may lack AVX2; MSVC /arch:AVX2 also requires it,
           # but the portable Linux baseline (x86-64-v3) implies AVX2 as well.
           MACOSX_DEPLOYMENT_TARGET: "15.0"
+          CIBW_ENVIRONMENT_WINDOWS: >-
+            CMAKE_ARGS="-DTURBOQUANT_PORTABLE=ON -DOpenMP_CXX_FLAGS=/openmp"
+            CMAKE_GENERATOR="Ninja"
+          CIBW_BEFORE_BUILD_WINDOWS: "pip install ninja"
 
       - uses: actions/upload-artifact@v7
         with:
