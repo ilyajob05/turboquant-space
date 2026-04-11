@@ -1,0 +1,36 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.13", "pybind11-stubgen"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "turboquant-space"
+version = "0.1.0"
+description = "TurboQuant (ICLR 2026) — SIMD-accelerated 4/8-bit quantization Space for ANN"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+
+[project.urls]
+Homepage = "https://github.com/ilyajob05/turboquant-space"
+Repository = "https://github.com/ilyajob05/turboquant-space"
+
+[tool.scikit-build]
+cmake.source-dir = "."
+cmake.args = ["-DCMAKE_BUILD_TYPE=Release"]
+wheel.packages = ["python/turboquant"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8",
+    "pytest-benchmark",
+    "numpy",
+    "pybind11",
+    "pybind11-stubgen",
+    "pandas",
+    "seaborn",
+    "matplotlib",
+    "tqdm",
+]
+package = true
+
