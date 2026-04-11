@@ -1,5 +1,7 @@
 # turboquant-space
 
+This library was inspired by the article https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/. The library is optimized for efficient data allocation in memory for 3+1 and 7+1 bit quantization schemes.
+
 SIMD-accelerated 4/8-bit vector quantization for approximate nearest neighbor
 search, based on **TurboQuant** (ICLR 2026). Standalone C++17 library with
 Python bindings.
