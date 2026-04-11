@@ -46,7 +46,7 @@ jobs:
           CIBW_TEST_COMMAND: pytest {project}/python/tests -v
           # macOS x86_64 runners may lack AVX2; MSVC /arch:AVX2 also requires it,
           # but the portable Linux baseline (x86-64-v3) implies AVX2 as well.
-          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
 
       - uses: actions/upload-artifact@v7
         with:
