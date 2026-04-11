@@ -32,9 +32,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Enable Long Paths
-        run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
-        shell: powershell
+      # - name: Enable Long Paths
+      #   run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\FileSystem' -Name 'LongPathsEnabled' -Value 1
+      #   shell: powershell
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.4.1
