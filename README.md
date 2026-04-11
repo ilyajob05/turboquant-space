@@ -52,11 +52,27 @@ for FAISS. It is the *distance* layer. Plug it into your own index, or use
 pip install turboquant-space
 ```
 
-Wheels are built for CPython 3.11–3.13 on Linux (x86\_64, aarch64) and macOS
-(x86\_64, arm64). SIMD path is picked at compile time: NEON on arm64,
-AVX/SSE on x86. On a machine without any of those, scalar fallbacks are used.
+Prebuilt wheels are published for CPython 3.11–3.13 on Linux (x86\_64,
+aarch64), macOS (x86\_64, arm64), and Windows (AMD64). They target a
+conservative CPU baseline — **x86-64-v3** (AVX2 + FMA + BMI2) on x64 and
+**armv8-a** (NEON) on arm64 — so a single wheel runs on anything produced in
+the last ~8 years. A C++ compiler is **not** required for this path.
 
-### From source
+### Build from source for maximum performance
+
+The prebuilt wheels trade a few percent for portability. If you have a C++
+compiler and want the binary tuned to *your* CPU (AVX-512 on Zen4 / Ice Lake,
+SVE on Graviton, etc.), force pip to skip the wheel and compile from sdist:
+
+```bash
+pip install turboquant-space --no-binary turboquant-space
+```
+
+This invokes CMake with `-march=native`, so every available instruction set
+on the build machine is enabled. Requires CMake ≥ 3.18 and a C++17 compiler;
+on macOS also `brew install libomp` for multi-threaded batch ops.
+
+### From a git checkout
 
 ```bash
 git clone https://github.com/ilyajob05/turboquant-space
@@ -64,9 +80,8 @@ cd turboquant-space
 uv sync                       # or: pip install -e .
 ```
 
-Requires CMake ≥ 3.18 and a C++17 compiler. OpenMP is optional; on macOS with
-Apple Clang install it with `brew install libomp` to enable multi-threaded
-batch ops (the build falls back to single-threaded if not found).
+Same story: local builds use `-march=native` by default. Pass
+`-DTURBOQUANT_PORTABLE=ON` to CMake if you need a portable baseline instead.
 
 ---
 
@@ -190,7 +205,7 @@ correctness.
 
 The immediate priorities, in order:
 
-1. **Publish wheels to PyPI** 
+1. **Publish wheels to PyPI** (cibuildwheel workflow in place; awaiting first tagged release)
 
 Contributions welcome. The codebase is small (two headers, one bindings
 file, ~2k lines) and deliberately kept that way — if a change makes it

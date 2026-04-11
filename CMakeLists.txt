@@ -60,6 +60,13 @@ set_target_properties(_turboquant PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python/turboquant"
 )
 
+# TURBOQUANT_PORTABLE=ON  → conservative baseline for prebuilt wheels
+#                           (x86-64-v3 on x64, armv8-a on arm64, /arch:AVX2 on MSVC).
+# TURBOQUANT_PORTABLE=OFF → -march=native, tuned for the build machine.
+# Default is OFF so local `pip install` / `uv sync` get max performance;
+# cibuildwheel sets it to ON to produce portable wheels.
+option(TURBOQUANT_PORTABLE "Build with a portable CPU baseline instead of -march=native" OFF)
+
 if(MSVC)
     target_compile_options(_turboquant PRIVATE /O2 /fp:fast /arch:AVX2)
 else()
@@ -68,6 +75,15 @@ else()
         -ffast-math
         -fno-finite-math-only
     )
+    if(TURBOQUANT_PORTABLE)
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+            target_compile_options(_turboquant PRIVATE -march=x86-64-v3)
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+            target_compile_options(_turboquant PRIVATE -march=armv8-a)
+        endif()
+    else()
+        target_compile_options(_turboquant PRIVATE -march=native)
+    endif()
 endif()
 
 target_compile_definitions(_turboquant PRIVATE
