@@ -6,29 +6,20 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-list(APPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/.venv")
-
-if(WIN32)
-    set(PYTHON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/.venv/Scripts/python.exe")
-else()
-    set(PYTHON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python")
-endif()
+find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
 execute_process(
-    COMMAND "${PYTHON_PATH}" -c "import pybind11; print(pybind11.get_cmake_dir())"
+    COMMAND "${Python_EXECUTABLE}" -c "import pybind11; print(pybind11.get_cmake_dir())"
     OUTPUT_VARIABLE PYBIND11_DIR
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_VARIABLE PY_ERROR
+    RESULT_VARIABLE PY_RESULT
 )
 
-if(NOT PYBIND11_DIR)
-    message(FATAL_ERROR "pybind11 not found in .venv! Error: ${PY_ERROR}")
+if(NOT PY_RESULT EQUAL 0 OR NOT PYBIND11_DIR)
+    message(FATAL_ERROR "pybind11 not found via ${Python_EXECUTABLE}! Error: ${PY_ERROR}")
 endif()
 
-message(${CMAKE_PREFIX_PATH})
-message(${PYBIND11_DIR})
-
-# find_package(pybind11 REQUIRED)
 find_package(pybind11 REQUIRED PATHS ${PYBIND11_DIR} NO_DEFAULT_PATH)
 
 pybind11_add_module(_turboquant python/turboquant/bindings.cpp)
