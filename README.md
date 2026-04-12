@@ -4,7 +4,6 @@
 ![Build](https://img.shields.io/github/actions/workflow/status/ilyajob05/turboquant-space/publish.yml)
 ![Python](https://img.shields.io/pypi/pyversions/turboquant-space)
 ![PyPI](https://img.shields.io/pypi/v/turboquant-space)
-![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/ilyajob05/turboquant-space/total)
 
 
 
