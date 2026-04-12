@@ -3,50 +3,72 @@ import numpy as np
 from turboquant import TurboQuantSpace as TQS
 
 
+def _time_it(fn, min_time=0.05, max_repeats=200):
+    """Run fn() enough times to accumulate >= min_time seconds, return mean seconds per call."""
+    # one untimed warm-up
+    fn()
+    repeats = 1
+    while True:
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            fn()
+        dt = time.perf_counter() - t0
+        if dt >= min_time or repeats >= max_repeats:
+            return dt / repeats
+        # grow repeats geometrically toward the target
+        repeats = min(max_repeats, max(repeats * 2, int(repeats * min_time / max(dt, 1e-9))))
+
+
 def run_benchmark():
-    dims = [128, 768, 4096]
-    batch_sizes = [1, 100, 10000]
-    bits = 8
+    """Kernel throughput microbenchmark.
 
-    print(f"{'Dim':>6} | {'Batch':>7} | {'Task':>15} | {'Time (ms)':>10} | {'Ops/sec':>12}")
-    print("-" * 60)
+    All rows report a single unit in the rightmost column: distances/sec for
+    distance kernels, vectors/sec for the encoder. This makes asymmetric
+    (1-to-N, float query vs code DB) and symmetric (M-to-N, code vs code)
+    paths directly comparable per distance computed.
+    """
+    dims = [128, 512, 768, 1024, 2048, 4096]
+    batch_sizes = [1, 50, 100, 1000, 5000, 10000]
+    bits_list = [4, 8]
 
-    for dim in dims:
-        space = TQS(dim, bits_per_coord=bits)
-        for n in batch_sizes:
-            # Data
-            X = np.random.randn(n, dim).astype(np.float32)
-            Q = np.random.randn(n, dim).astype(np.float32)
+    header = (
+        f"{'Dim':>6} | {'Batch':>7} | {'Task':>20} | {'Time (ms)':>10} | "
+        f"{'Throughput':>15} | {'Unit':>8}"
+    )
 
-            # 1. Coding test
-            start = time.perf_counter()
-            codes = space.encode_batch(X)
-            end = time.perf_counter()
+    for bits in bits_list:
+        print()
+        print(f"=== bits_per_coord = {bits} ===")
+        print(header)
+        print("-" * len(header))
 
-            dt = (end - start)
-            print(f"{dim:6} | {n:7} | {'Encoding':>15} | {dt * 1000:10.2f} | {int(n / dt):12,}")
+        for dim in dims:
+            space = TQS(dim, bits_per_coord=bits)
+            for n in batch_sizes:
+                X = np.random.randn(n, dim).astype(np.float32)
+                Q = np.random.randn(n, dim).astype(np.float32)
+                q_single = Q[0]
 
-            # 2. Тест Query-to-Batch Distance (Asymmetric)
-            # Get 1 request and find of N codes (from ANN)
-            q_single = Q[0]
-            start = time.perf_counter()
-            _ = space.distance_1_to_n(q_single, codes)
-            end = time.perf_counter()
+                # 1. Encoder: vectors/sec
+                dt = _time_it(lambda: space.encode_batch(X))
+                print(f"{dim:6} | {n:7} | {'Encoding':>20} | {dt * 1000:10.2f} | "
+                      f"{int(n / dt):15,} | {'vec/s':>8}")
 
-            dt = (end - start)
-            print(f"{dim:6} | {n:7} | {'1-to-N Dist':>15} | {dt * 1000:10.2f} | {int(n / dt):12,}")
+                codes = space.encode_batch(X)
 
-            # 3. Symmetric (Batch-to-Batch)
-            if n > 1:
-                codes_q = space.encode_batch(Q)
-                start = time.perf_counter()
-                _ = space.distance_m_to_n_symmetric(codes_q, codes)
-                end = time.perf_counter()
+                # 2. Asymmetric 1-to-N: n distances per call → distances/sec
+                dt = _time_it(lambda: space.distance_1_to_n(q_single, codes))
+                print(f"{dim:6} | {n:7} | {'1-to-N (asym)':>20} | {dt * 1000:10.2f} | "
+                      f"{int(n / dt):15,} | {'dist/s':>8}")
 
-                dt = (end - start)
-                total_ops = n * n
-                print(f"{dim:6} | {n:7} | {'M-to-N Sym':>15} | {dt * 1000:10.2f} | {int(total_ops / dt):12,}")
-        print("-" * 60)
+                # 3. Symmetric M-to-N: n*n distances per call → distances/sec
+                if n > 1:
+                    codes_q = space.encode_batch(Q)
+                    dt = _time_it(lambda: space.distance_m_to_n_symmetric(codes_q, codes))
+                    total_pairs = n * n
+                    print(f"{dim:6} | {n:7} | {'M-to-N (sym)':>20} | {dt * 1000:10.2f} | "
+                          f"{int(total_pairs / dt):15,} | {'dist/s':>8}")
+            print("-" * len(header))
 
 
 def run_threading_benchmark():

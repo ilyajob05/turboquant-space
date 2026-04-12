@@ -159,6 +159,11 @@ plots under `results/plots/`:
 Useful flags: `--skip-sift`, `--skip-synthetic`, `--threads 1,4,8`,
 `--bits 4,8`, `--no-show` (for headless CI).
 
+Measured numbers from real hardware (Apple M3 and more as they come in)
+live in [`docs/benchmarks.md`](docs/benchmarks.md). Headline from M3,
+`dim=128, batch=10000, bits=8`: **~88M symmetric M-to-N ops/sec** and
+**~2.8M encode/sec** on a single laptop.
+
 ---
 
 ## Layout and build
