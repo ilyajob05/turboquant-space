@@ -1,11 +1,10 @@
 # turboquant-space
 
-![GitHub License](https://img.shields.io/github/license/ilyajob05/turboquant-space)
+![License](https://img.shields.io/pypi/l/turboquant-space)
 ![Build](https://img.shields.io/github/actions/workflow/status/ilyajob05/turboquant-space/publish.yml)
-![PyPI - Wheel](https://img.shields.io/pypi/wheel/turboquant-space)
 ![Python](https://img.shields.io/pypi/pyversions/turboquant-space)
 ![PyPI](https://img.shields.io/pypi/v/turboquant-space)
-![License](https://img.shields.io/pypi/l/turboquant-space)
+![PyPI](https://img.shields.io/pypi/v/turboquant-space)
 ![Downloads](https://img.shields.io/pypi/dm/turboquant-space)
 
 
