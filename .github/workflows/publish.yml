@@ -3,63 +3,89 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 jobs:
   build_wheels:
-    name: Build wheels on ${{ matrix.os }}
+    name: ${{ matrix.os }} ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-13, macos-14]
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+          - os: windows-latest
+            arch: AMD64
+          - os: macos-15-intel
+            arch: x86_64
+          - os: macos-latest
+            arch: arm64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.21
+        uses: pypa/cibuildwheel@v3.4.1
         env:
+          CIBW_ARCHS: ${{ matrix.arch }}
           CIBW_BUILD: "cp311-* cp312-* cp313-*"
-          CIBW_SKIP: "*-musllinux_* *-manylinux_i686"
-          CIBW_BEFORE_ALL_MACOS: brew install libomp
+          CIBW_SKIP: "*-musllinux_* pp*"
+          CIBW_BUILD_VERBOSITY: 1
+          CIBW_ENVIRONMENT: >-
+            CMAKE_ARGS="-DTURBOQUANT_PORTABLE=ON"
+          CIBW_BEFORE_BUILD_MACOS: brew install libomp
           CIBW_TEST_REQUIRES: pytest numpy
           CIBW_TEST_COMMAND: pytest {project}/python/tests -v
+          # macOS x86_64 runners may lack AVX2; MSVC /arch:AVX2 also requires it,
+          # but the portable Linux baseline (x86-64-v3) implies AVX2 as well.
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
+          CIBW_ENVIRONMENT_WINDOWS: >-
+            CMAKE_ARGS="-DTURBOQUANT_PORTABLE=ON -DOpenMP_CXX_FLAGS=/openmp"
+            CMAKE_GENERATOR="Ninja"
+          CIBW_BEFORE_BUILD_WINDOWS: "pip install ninja"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.os }}-${{ matrix.arch }}
           path: ./wheelhouse/*.whl
 
   build_sdist:
     name: Build sdist
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
+      - uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.12"
 
       - name: Build sdist
-        run: uv build --sdist
+        run: |
+          pip install build
+          python -m build --sdist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
-          path: dist/*.tar.gz
+          path: ./dist/*.tar.gz
 
   publish:
+    name: Publish to PyPI
     needs: [build_wheels, build_sdist]
     runs-on: ubuntu-latest
+    if: github.event_name == 'release'
     environment:
       name: pypi
       url: https://pypi.org/p/turboquant-space
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@v1.13.0
