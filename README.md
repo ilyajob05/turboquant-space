@@ -1,5 +1,15 @@
 # turboquant-space
 
+![GitHub License](https://img.shields.io/github/license/ilyajob05/turboquant-space)
+![PyPI - Wheel](https://img.shields.io/pypi/wheel/turboquant-space)
+![Python](https://img.shields.io/pypi/pyversions/turboquant-space)
+![PyPI](https://img.shields.io/pypi/v/turboquant-space)
+![License](https://img.shields.io/pypi/l/turboquant-space)
+![Downloads](https://img.shields.io/pypi/dm/turboquant-space)
+![Build](https://img.shields.io/github/actions/workflow/status/ilyajob05/turboquant-space/publish.yml)
+![Wheels](https://img.shields.io/pypi/wheel/turboquant-space)
+
+
 This library was inspired by the article https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/. The library is optimized for efficient data allocation in memory for 3+1 and 7+1 bit quantization schemes.
 
 SIMD-accelerated 4/8-bit vector quantization for approximate nearest neighbor
