@@ -4,7 +4,8 @@
 ![Build](https://img.shields.io/github/actions/workflow/status/ilyajob05/turboquant-space/publish.yml)
 ![Python](https://img.shields.io/pypi/pyversions/turboquant-space)
 ![PyPI](https://img.shields.io/pypi/v/turboquant-space)
-![Downloads](https://img.shields.io/pypi/dm/turboquant-space)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/ilyajob05/turboquant-space/total)
+
 
 
 This library was inspired by the article https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/. The library is optimized for efficient data allocation in memory for 3+1 and 7+1 bit quantization schemes.
