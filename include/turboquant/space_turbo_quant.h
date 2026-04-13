@@ -155,6 +155,8 @@ using TQDistFunc = float (*)(const void *, const void *, const void *);
 
 static float distSearchScalar(const void *q, const void *code_buf, const void *qty_ptr);
 static float distBuildScalar(const void *pVect1, const void *pVect2, const void *param_ptr);
+static float distBuildFullScalar(const void *pVect1, const void *pVect2, const void *param_ptr);
+static float distBuildLightScalar(const void *pVect1, const void *pVect2, const void *param_ptr);
 static float distSearchScalarB4(const void *q, const void *code_buf, const void *qty_ptr);
 static float distBuildScalarB4(const void *pVect1, const void *pVect2, const void *param_ptr);
 
@@ -300,6 +302,7 @@ public:
     const float *centroids() const { return centroids_; }
     uint64_t rotSeed() const { return rot_seed_; }
     uint64_t qjlSeed() const { return qjl_seed_; }
+    const float *qjlSigns() const { return qjl_signs_precomp_.data(); }
 
     // -- Encoding -------------------------------------------------------------
 
@@ -419,9 +422,21 @@ public:
         return distance(pq, code_buf);
     }
 
-    /// Symmetric distance: code × code.
+    /// Symmetric distance: code × code (MSE-only, original).
     float distanceSymmetric(const void *code_a, const void *code_b) const {
         return fstdistfunc_build_(code_a, code_b, this);
+    }
+
+    /// Symmetric distance with full QJL correction (reconstructs centroids
+    /// + Hadamard). Computes all 4 inner product terms.
+    float distanceSymmetricFull(const void *code_a, const void *code_b) const {
+        return distBuildFullScalar(code_a, code_b, this);
+    }
+
+    /// Symmetric distance with light QJL correction (sign-bit dot product only).
+    /// Adds only the <e_a, e_b> term — cheap, no Hadamard needed.
+    float distanceSymmetricLight(const void *code_a, const void *code_b) const {
+        return distBuildLightScalar(code_a, code_b, this);
     }
 
     // -- Batch distance -------------------------------------------------------
@@ -464,6 +479,38 @@ public:
             for (size_t j = 0; j < n; ++j)
                 row[j] = fstdistfunc_build_(ba + static_cast<size_t>(i) * cs,
                                             bb + j * cs, this);
+        }
+    }
+
+    /// M-to-N symmetric with full QJL correction.
+    void distanceBatchMToNSymmetricFull(const void *codes_a, size_t m,
+                                        const void *codes_b, size_t n,
+                                        float *out) const {
+        const char *ba = static_cast<const char *>(codes_a);
+        const char *bb = static_cast<const char *>(codes_b);
+        const size_t cs = data_size_;
+        TURBOQUANT_OMP_PARALLEL_FOR(num_threads_, m)
+        for (long long i = 0; i < static_cast<long long>(m); ++i) {
+            float *row = out + static_cast<size_t>(i) * n;
+            for (size_t j = 0; j < n; ++j)
+                row[j] = distBuildFullScalar(ba + static_cast<size_t>(i) * cs,
+                                             bb + j * cs, this);
+        }
+    }
+
+    /// M-to-N symmetric with light QJL correction (sign-bit only).
+    void distanceBatchMToNSymmetricLight(const void *codes_a, size_t m,
+                                         const void *codes_b, size_t n,
+                                         float *out) const {
+        const char *ba = static_cast<const char *>(codes_a);
+        const char *bb = static_cast<const char *>(codes_b);
+        const size_t cs = data_size_;
+        TURBOQUANT_OMP_PARALLEL_FOR(num_threads_, m)
+        for (long long i = 0; i < static_cast<long long>(m); ++i) {
+            float *row = out + static_cast<size_t>(i) * n;
+            for (size_t j = 0; j < n; ++j)
+                row[j] = distBuildLightScalar(ba + static_cast<size_t>(i) * cs,
+                                              bb + j * cs, this);
         }
     }
 };
@@ -531,6 +578,142 @@ static float distBuildScalar(const void *pVect1, const void *pVect2,
               (centroids[packed_b[i] >> 1] * sigma_b);
 
   const float ip = ip_rot * norm_a * norm_b;
+  return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
+}
+
+// ---------------------------------------------------------------------------
+// Symmetric distance with QJL correction — "full" variant
+// Reconstructs r̃ from centroids, applies QJL Hadamard, computes all 4 IP terms:
+//   <r_a, r_b> = <r̃_a, r̃_b> + <r̃_a, e_b> + <e_a, r̃_b> + <e_a, e_b>
+// ---------------------------------------------------------------------------
+
+// Helper: extract packed unit (sq_idx << 1 | qjl_bit) for coordinate i
+static inline uint8_t extractUnit(const uint8_t *packed, size_t i, bool nibble) {
+  if (nibble) {
+    uint8_t byte = packed[i >> 1];
+    return (i & 1) ? (byte >> 4) : (byte & 0x0F);
+  }
+  return packed[i];
+}
+
+static float distBuildFullScalar(const void *pVect1, const void *pVect2,
+                                 const void *param_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
+  const size_t dim = space->paddedDim();
+  const size_t pb = space->packedBytes();
+  const bool nibble = space->packedNibbles();
+  const float *centroids = space->centroids();
+
+  const char *buf_a = static_cast<const char *>(pVect1);
+  const char *buf_b = static_cast<const char *>(pVect2);
+
+  const uint8_t *packed_a = reinterpret_cast<const uint8_t *>(buf_a);
+  const float *meta_a = reinterpret_cast<const float *>(buf_a + pb);
+  const float norm_a = meta_a[0];
+  const float gamma_a = meta_a[1];
+  const float sigma_a = meta_a[2];
+
+  const uint8_t *packed_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + pb);
+  const float norm_b = meta_b[0];
+  const float gamma_b = meta_b[1];
+  const float sigma_b = meta_b[2];
+
+  // Term 1: <r̃_a, r̃_b> and reconstruct for Hadamard
+  float ip_mse = 0.0f;
+  std::vector<float> recon_a(dim), recon_b(dim);
+  for (size_t i = 0; i < dim; ++i) {
+    uint8_t ua = extractUnit(packed_a, i, nibble);
+    uint8_t ub = extractUnit(packed_b, i, nibble);
+    float ca = centroids[ua >> 1] * sigma_a;
+    float cb = centroids[ub >> 1] * sigma_b;
+    ip_mse += ca * cb;
+    recon_a[i] = ca;
+    recon_b[i] = cb;
+  }
+
+  // Apply QJL Hadamard to reconstructed vectors
+  randomizedHadamard(recon_a.data(), space->qjlSigns(), dim);
+  randomizedHadamard(recon_b.data(), space->qjlSigns(), dim);
+
+  // Term 2: <r̃_a, e_b> ≈ scale * gamma_b * Σ(s̃_a[i] * sign_b[i])
+  // Term 3: <e_a, r̃_b> ≈ scale * gamma_a * Σ(sign_a[i] * s̃_b[i])
+  // Term 4: <e_a, e_b> ≈ (π/(2d)) * gamma_a * gamma_b * Σ(sign_a * sign_b)
+  float dot_recon_a_sign_b = 0.0f;
+  float dot_sign_a_recon_b = 0.0f;
+  float dot_signs = 0.0f;
+  for (size_t i = 0; i < dim; ++i) {
+    uint8_t ua = extractUnit(packed_a, i, nibble);
+    uint8_t ub = extractUnit(packed_b, i, nibble);
+    float sa = (ua & 1) ? 1.0f : -1.0f;
+    float sb = (ub & 1) ? 1.0f : -1.0f;
+    dot_recon_a_sign_b += recon_a[i] * sb;
+    dot_sign_a_recon_b += sa * recon_b[i];
+    dot_signs += sa * sb;
+  }
+  float term2 = space->scale() * gamma_b * dot_recon_a_sign_b;
+  float term3 = space->scale() * gamma_a * dot_sign_a_recon_b;
+  const float pi_over_2d = static_cast<float>(M_PI) /
+                           (2.0f * static_cast<float>(dim));
+  float term4 = pi_over_2d * gamma_a * gamma_b * dot_signs;
+
+  float total_correction = term2 + term3 + term4;
+  // Clamp correction to avoid overflow when residuals are large (low bit budgets)
+  float max_corr = std::abs(ip_mse);
+  total_correction = std::max(-max_corr, std::min(max_corr, total_correction));
+
+  const float ip = (ip_mse + total_correction) * norm_a * norm_b;
+  return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
+}
+
+// ---------------------------------------------------------------------------
+// Symmetric distance with QJL correction — "light" variant
+// Only adds the cheap <e_a, e_b> term via sign bit dot product (popcount).
+// No Hadamard needed — just XOR + popcount on packed sign bits.
+// ---------------------------------------------------------------------------
+
+static float distBuildLightScalar(const void *pVect1, const void *pVect2,
+                                  const void *param_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
+  const size_t dim = space->paddedDim();
+  const size_t pb = space->packedBytes();
+  const bool nibble = space->packedNibbles();
+  const float *centroids = space->centroids();
+
+  const char *buf_a = static_cast<const char *>(pVect1);
+  const char *buf_b = static_cast<const char *>(pVect2);
+
+  const uint8_t *packed_a = reinterpret_cast<const uint8_t *>(buf_a);
+  const float *meta_a = reinterpret_cast<const float *>(buf_a + pb);
+  const float norm_a = meta_a[0];
+  const float gamma_a = meta_a[1];
+  const float sigma_a = meta_a[2];
+
+  const uint8_t *packed_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + pb);
+  const float norm_b = meta_b[0];
+  const float gamma_b = meta_b[1];
+  const float sigma_b = meta_b[2];
+
+  float ip_mse = 0.0f;
+  int agree = 0;
+  for (size_t i = 0; i < dim; ++i) {
+    uint8_t ua = extractUnit(packed_a, i, nibble);
+    uint8_t ub = extractUnit(packed_b, i, nibble);
+    ip_mse += (centroids[ua >> 1] * sigma_a) *
+              (centroids[ub >> 1] * sigma_b);
+    agree += ((ua ^ ub) & 1) == 0 ? 1 : 0;
+  }
+  float dot_signs = static_cast<float>(2 * agree - static_cast<int>(dim));
+
+  const float pi_over_2d = static_cast<float>(M_PI) /
+                           (2.0f * static_cast<float>(dim));
+  float correction = pi_over_2d * gamma_a * gamma_b * dot_signs;
+  // Clamp correction to avoid overflow when residuals are large (low bit budgets)
+  float max_corr = std::abs(ip_mse);
+  correction = std::max(-max_corr, std::min(max_corr, correction));
+
+  const float ip = (ip_mse + correction) * norm_a * norm_b;
   return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
 }
 

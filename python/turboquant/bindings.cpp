@@ -199,6 +199,54 @@ PYBIND11_MODULE(_turboquant, m) {
              },
              py::arg("codes_a"), py::arg("codes_b"))
 
+        // === M-to-N symmetric with full QJL correction ===
+        .def("distance_m_to_n_symmetric_full",
+             [](const TurboQuantSpace &self, py::buffer codes_a, py::buffer codes_b) {
+                 const size_t cs = self.codeSizeBytes();
+                 auto ai = codes_a.request();
+                 auto bi = codes_b.request();
+                 if (ai.itemsize != 1 || bi.itemsize != 1)
+                     throw py::value_error("codes must be uint8");
+                 ssize_t ta = 1, tb = 1;
+                 for (auto s : ai.shape) ta *= s;
+                 for (auto s : bi.shape) tb *= s;
+                 if (ta % static_cast<ssize_t>(cs) != 0 ||
+                     tb % static_cast<ssize_t>(cs) != 0)
+                     throw py::value_error("codes size not a multiple of code_size_bytes");
+                 const size_t m = ta / cs;
+                 const size_t n = tb / cs;
+                 auto out = py::array_t<float>({static_cast<ssize_t>(m),
+                                                 static_cast<ssize_t>(n)});
+                 self.distanceBatchMToNSymmetricFull(ai.ptr, m, bi.ptr, n,
+                                                     out.mutable_data());
+                 return out;
+             },
+             py::arg("codes_a"), py::arg("codes_b"))
+
+        // === M-to-N symmetric with light QJL correction ===
+        .def("distance_m_to_n_symmetric_light",
+             [](const TurboQuantSpace &self, py::buffer codes_a, py::buffer codes_b) {
+                 const size_t cs = self.codeSizeBytes();
+                 auto ai = codes_a.request();
+                 auto bi = codes_b.request();
+                 if (ai.itemsize != 1 || bi.itemsize != 1)
+                     throw py::value_error("codes must be uint8");
+                 ssize_t ta = 1, tb = 1;
+                 for (auto s : ai.shape) ta *= s;
+                 for (auto s : bi.shape) tb *= s;
+                 if (ta % static_cast<ssize_t>(cs) != 0 ||
+                     tb % static_cast<ssize_t>(cs) != 0)
+                     throw py::value_error("codes size not a multiple of code_size_bytes");
+                 const size_t m = ta / cs;
+                 const size_t n = tb / cs;
+                 auto out = py::array_t<float>({static_cast<ssize_t>(m),
+                                                 static_cast<ssize_t>(n)});
+                 self.distanceBatchMToNSymmetricLight(ai.ptr, m, bi.ptr, n,
+                                                      out.mutable_data());
+                 return out;
+             },
+             py::arg("codes_a"), py::arg("codes_b"))
+
         .def("prepare_query",
              [](const TurboQuantSpace &self, py::buffer query) {
                  const float *q = as_float_ptr(query, self.dim(), "query", 1);

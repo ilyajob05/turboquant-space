@@ -41,6 +41,32 @@ lookup against each code. On tiny batches (`n < ~500`) sym loses to asym
 because its `n²` work can't amortize the per-call overhead; on larger
 batches sym pulls ahead sharply, and for `dim=128` hits ~140M distances/sec.
 
+### Reading the `Time` column — work is not the same shape
+
+The two distance rows answer **different questions**, even though
+`Throughput (dist/s)` is directly comparable between them:
+
+- **`1-to-N (asym)`** measures the realistic online-search path: one
+  float query against `N` codes in the base. Work is `O(N)`, so at
+  `N=10000` the kernel computes **10⁴ pairs**.
+- **`M-to-N (sym)`** measures the realistic matrix path: every code in
+  an `M`-set vs every code in an `N`-set — dedup, clustering, full kNN
+  graph. Work is `O(M·N)`, so at `M=N=10000` the kernel computes
+  **10⁸ pairs — 10,000× more than the asym row on the same line**.
+
+That is why the `Time` column looks wildly different for the two modes
+at large batches: `1024/10000 asym` spends 0.68 ms on 10⁴ pairs
+(~14.7M dist/s), and `1024/10000 sym` spends 6010 ms on 10⁸ pairs
+(~16.6M dist/s). **Per-distance throughput is within ~15% of each
+other** — the wall-clock gap is purely the quadratic `M·N` shape of the
+sym benchmark, not extra work per pair or query conversion overhead
+(encoding is measured separately and costs ~13 ms for 10k vectors at
+`dim=1024`).
+
+If you want a wall-clock number for "symmetric, one query against N",
+read the asym row and treat it as a lower bound — the sym kernel on a
+`1×N` shape is faster per pair, not slower.
+
 ---
 
 ## Apple M3 (macOS, arm64, NEON)
