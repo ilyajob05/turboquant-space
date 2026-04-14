@@ -222,3 +222,6 @@ __marimo__/
 *.memsearch
 *.qtcreator
 turboquant-handoff.md
+*.jsonl
+*.tgz
+*.npy

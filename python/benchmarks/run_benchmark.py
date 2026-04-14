@@ -131,6 +131,36 @@ def load_sift1m() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return base, query, gt
 
 
+def load_dbpedia_single_file(file_path: str = "dbpedia_openai_100K_vectors.npy",
+                             n_query: int = 100,
+                             gt_k: int = 100) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    print(f"[dbpedia] loading {file_path}")
+    data = np.load(file_path)
+
+    dim = 1536
+    n_vectors = data.size // dim
+    data = data[:n_vectors * dim].reshape(n_vectors, dim)
+
+    query = data[:n_query].astype(np.float32)
+    base = data[n_query:].astype(np.float32)
+
+    print(f"[dbpedia] computing brute-force GT (k={gt_k}) on base={base.shape}")
+    # L2^2 = ||q||^2 - 2 q·b + ||b||^2; omit ||q||^2 (const per row) for argpartition.
+    base_sq = np.einsum("ij,ij->i", base, base)
+    gt = np.empty((n_query, gt_k), dtype=np.int32)
+    chunk = 32
+    for i in range(0, n_query, chunk):
+        q = query[i:i + chunk]
+        d = base_sq[None, :] - 2.0 * (q @ base.T)
+        idx = np.argpartition(d, kth=gt_k, axis=1)[:, :gt_k]
+        rows = np.arange(d.shape[0])[:, None]
+        order = np.argsort(d[rows, idx], axis=1)
+        gt[i:i + chunk] = idx[rows, order].astype(np.int32)
+
+    print(f"[dbpedia] split complete: base={base.shape}, query={query.shape}, gt={gt.shape}")
+    return base, query, gt
+
+
 # ---------------------------------------------------------------------------
 # Measurement helpers
 # ---------------------------------------------------------------------------
@@ -413,11 +443,12 @@ def main() -> None:
         bar = tqdm(total=total_cfgs, desc="benchmark", unit="cfg")
 
         if not args.skip_sift:
-            base, query, gt = load_sift1m()
+            # base, query, gt = load_sift1m()
+            base, query, gt = load_dbpedia_single_file()
+            full_base_n = base.shape[0]
             if args.n_base is not None:
                 base = base[: args.n_base]
-                # gt is only valid w.r.t. full base; invalidate recall if truncated
-                gt_for_run = gt if args.n_base >= 1_000_000 else None
+                gt_for_run = gt if args.n_base >= full_base_n else None
             else:
                 gt_for_run = gt
             for bits in bits_list:
