@@ -12,6 +12,9 @@ This library was inspired by the article https://research.google/blog/turboquant
 SIMD-accelerated 4/8-bit vector quantization for approximate nearest neighbor
 search, based on **TurboQuant** (ICLR 2026). Standalone C++17 library with
 Python bindings.
+```bash
+pip install turboquant-space
+```
 
 ```python
 from turboquant import TurboQuantSpace
