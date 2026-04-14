@@ -131,6 +131,24 @@ def load_sift1m() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return base, query, gt
 
 
+def load_dbpedia_single_file(file_path: str = "dbpedia_openai_100K_vectors.npy",
+                             n_query: int = 100) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    print(f"[dbpedia] loading {file_path}")
+    data = np.load(file_path)
+
+    dim = 1536
+    n_vectors = data.size // dim
+    data = data[:n_vectors * dim].reshape(n_vectors, dim)
+
+    query = data[:n_query].astype(np.float32)
+    base = data[n_query:].astype(np.float32)
+
+    gt = np.zeros((n_query, 100), dtype=np.int32)
+
+    print(f"[dbpedia] split complete: base={base.shape}, query={query.shape}")
+    return base, query, gt
+
+
 # ---------------------------------------------------------------------------
 # Measurement helpers
 # ---------------------------------------------------------------------------
@@ -413,7 +431,8 @@ def main() -> None:
         bar = tqdm(total=total_cfgs, desc="benchmark", unit="cfg")
 
         if not args.skip_sift:
-            base, query, gt = load_sift1m()
+            # base, query, gt = load_sift1m()
+            base, query, gt = load_dbpedia_single_file()
             if args.n_base is not None:
                 base = base[: args.n_base]
                 # gt is only valid w.r.t. full base; invalidate recall if truncated
