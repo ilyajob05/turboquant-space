@@ -228,11 +228,6 @@ Contributions welcome. The codebase is small (two headers, one bindings
 file, ~2k lines) and deliberately kept that way — if a change makes it
 harder to read, that is a reason to push back on it.
 
----
-
-## License
-
-MIT. See `LICENSE`.
 
 ## Citation
 
