@@ -96,7 +96,27 @@ def _read_ivecs(path: Path) -> np.ndarray:
 #         print(f"[sift] cached at {CACHE_DIR}")
 
 
-def load_sift1m() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _l2_normalize(x: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(x, axis=1, keepdims=True)
+    n[n == 0] = 1.0
+    return (x / n).astype(np.float32)
+
+
+def _compute_gt_l2(base: np.ndarray, query: np.ndarray, gt_k: int) -> np.ndarray:
+    base_sq = np.einsum("ij,ij->i", base, base)
+    gt = np.empty((query.shape[0], gt_k), dtype=np.int32)
+    chunk = 32
+    for i in range(0, query.shape[0], chunk):
+        q = query[i:i + chunk]
+        d = base_sq[None, :] - 2.0 * (q @ base.T)
+        idx = np.argpartition(d, kth=gt_k, axis=1)[:, :gt_k]
+        rows = np.arange(d.shape[0])[:, None]
+        order = np.argsort(d[rows, idx], axis=1)
+        gt[i:i + chunk] = idx[rows, order].astype(np.int32)
+    return gt
+
+
+def load_sift1m(metric: str = "l2") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (base[1e6,128], query[1e4,128], gt[1e4,100])."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     base_path = CACHE_DIR / "sift_base.fvecs"
@@ -105,36 +125,38 @@ def load_sift1m() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
     if not (base_path.exists() and query_path.exists() and gt_path.exists()):
         tar_path = CACHE_DIR / "sift.tar.gz"
-
-        # Validation logic (omitted for brevity, keep your existing check)
         if not tar_path.exists():
             subprocess.run(["wget", "-O", str(tar_path), SIFT_URL], check=True)
-
         print(f"[sift] extracting to {CACHE_DIR}")
         with tarfile.open(tar_path, "r:gz") as tf:
             for member in tf.getmembers():
                 name = os.path.basename(member.name)
                 if name in ("sift_base.fvecs", "sift_query.fvecs", "sift_groundtruth.ivecs"):
                     member.name = name
-                    # Added 'filter' to silence the DeprecationWarning
                     tf.extract(member, CACHE_DIR, filter='data')
     else:
         print(f"[sift] cached at {CACHE_DIR}")
 
-    # CRITICAL: These must be outside the 'if' block to always return values
     print("[sift] reading vectors")
     base = _read_fvecs(base_path)
     query = _read_fvecs(query_path)
     gt = _read_ivecs(gt_path)
 
-    print(f"[sift] base={base.shape} query={query.shape} gt={gt.shape}")
+    if metric == "cosine":
+        base = _l2_normalize(base)
+        query = _l2_normalize(query)
+        # cached gt was built for raw L2 on un-normalized vectors; rebuild for cosine.
+        gt = _compute_gt_l2(base, query, gt_k=gt.shape[1])
+
+    print(f"[sift] base={base.shape} query={query.shape} gt={gt.shape} metric={metric}")
     return base, query, gt
 
 
 def load_dbpedia_single_file(file_path: str = "dbpedia_openai_100K_vectors.npy",
                              n_query: int = 100,
-                             gt_k: int = 100) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    print(f"[dbpedia] loading {file_path}")
+                             gt_k: int = 100,
+                             metric: str = "l2") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    print(f"[dbpedia] loading {file_path} metric={metric}")
     data = np.load(file_path)
 
     dim = 1536
@@ -144,18 +166,12 @@ def load_dbpedia_single_file(file_path: str = "dbpedia_openai_100K_vectors.npy",
     query = data[:n_query].astype(np.float32)
     base = data[n_query:].astype(np.float32)
 
+    if metric == "cosine":
+        base = _l2_normalize(base)
+        query = _l2_normalize(query)
+
     print(f"[dbpedia] computing brute-force GT (k={gt_k}) on base={base.shape}")
-    # L2^2 = ||q||^2 - 2 q·b + ||b||^2; omit ||q||^2 (const per row) for argpartition.
-    base_sq = np.einsum("ij,ij->i", base, base)
-    gt = np.empty((n_query, gt_k), dtype=np.int32)
-    chunk = 32
-    for i in range(0, n_query, chunk):
-        q = query[i:i + chunk]
-        d = base_sq[None, :] - 2.0 * (q @ base.T)
-        idx = np.argpartition(d, kth=gt_k, axis=1)[:, :gt_k]
-        rows = np.arange(d.shape[0])[:, None]
-        order = np.argsort(d[rows, idx], axis=1)
-        gt[i:i + chunk] = idx[rows, order].astype(np.int32)
+    gt = _compute_gt_l2(base, query, gt_k)
 
     print(f"[dbpedia] split complete: base={base.shape}, query={query.shape}, gt={gt.shape}")
     return base, query, gt
@@ -239,6 +255,7 @@ def run_config(
     n_query_mton: int,
     repeats: int,
     query_chunk: int,
+    metric: str = "l2",
 ) -> dict:
     dim = base.shape[1]
     n_base = base.shape[0]
@@ -270,6 +287,7 @@ def run_config(
 
     row = {
         "dataset": dataset,
+        "metric": metric,
         "n_base": n_base,
         "n_query": n_query,
         "dim": dim,
@@ -308,51 +326,70 @@ def make_plots(df: pd.DataFrame, plots_dir: Path) -> list[Path]:
     sns.set_theme(style="whitegrid")
     saved: list[Path] = []
 
-    # 1. Threading scaling on M-to-N throughput, faceted by (dataset, dim)
+    # 1. Threading scaling on M-to-N throughput — all datasets on one figure.
     scaling = df.copy()
     scaling["throughput_Mvps"] = scaling["query_mton_vps"] / 1e6
+    scaling["series"] = scaling["dataset"] + " dim=" + scaling["dim"].astype(str)
     g = sns.relplot(
         data=scaling,
         x="num_threads",
         y="throughput_Mvps",
-        hue="bits",
+        hue="series",
         style="bits",
-        col="dim",
-        row="dataset",
         kind="line",
         markers=True,
         dashes=False,
-        facet_kws={"sharey": False, "margin_titles": True},
-        height=3.2,
-        aspect=1.25,
+        height=4.5,
+        aspect=1.4,
     )
     g.set_axis_labels("threads", "M-to-N throughput (M dist/s)")
-    g.fig.suptitle("Threading scaling — distance_m_to_n", y=1.02)
-    p = plots_dir / "threading_scaling.png"
+    g.fig.suptitle("Threading scaling — distance_m_to_n (all datasets)", y=1.02)
+    p = plots_dir / "threading_scaling_mton.png"
     g.fig.savefig(p, dpi=150, bbox_inches="tight")
     saved.append(p)
 
-    # 2. Recall vs bits (SIFT only, num_threads=1 row to avoid duplicates)
-    sift = df[df["dataset"] == "sift1m"].copy()
-    if not sift.empty:
-        sift_recall = (
-            sift[sift["num_threads"] == sift["num_threads"].min()]
+    # 1b. Threading scaling on 1-to-N throughput (where parallelism is visible).
+    scaling1 = df.copy()
+    scaling1["throughput_Mvps"] = scaling1["query_1ton_vps"] / 1e6
+    scaling1["series"] = scaling1["dataset"] + " dim=" + scaling1["dim"].astype(str)
+    g1 = sns.relplot(
+        data=scaling1,
+        x="num_threads",
+        y="throughput_Mvps",
+        hue="series",
+        style="bits",
+        kind="line",
+        markers=True,
+        dashes=False,
+        height=4.5,
+        aspect=1.4,
+    )
+    g1.set_axis_labels("threads", "1-to-N throughput (M dist/s)")
+    g1.fig.suptitle("Threading scaling — distance_1_to_n (all datasets)", y=1.02)
+    p = plots_dir / "threading_scaling_1ton.png"
+    g1.fig.savefig(p, dpi=150, bbox_inches="tight")
+    saved.append(p)
+
+    # 2. Recall vs bits — all real datasets on one figure.
+    real = df[df["recall_at_10"].notna()].copy()
+    if not real.empty:
+        recall_df = (
+            real[real["num_threads"] == real["num_threads"].min()]
             .melt(
-                id_vars=["bits"],
+                id_vars=["dataset", "bits"],
                 value_vars=["recall_at_1", "recall_at_10", "recall_at_100"],
-                var_name="metric",
+                var_name="k",
                 value_name="recall",
             )
         )
-        fig, ax = plt.subplots(figsize=(6, 4))
-        sns.barplot(
-            data=sift_recall, x="bits", y="recall", hue="metric", ax=ax
+        g3 = sns.catplot(
+            data=recall_df, x="bits", y="recall", hue="k",
+            col="dataset", kind="bar", height=4, aspect=1.1,
         )
-        ax.set_ylim(0, 1)
-        ax.set_title("SIFT1M recall vs bits per coord")
-        fig.tight_layout()
-        p = plots_dir / "sift_recall.png"
-        fig.savefig(p, dpi=150, bbox_inches="tight")
+        g3.set(ylim=(0, 1))
+        g3.fig.suptitle("Recall vs bits per coord", y=1.02)
+        p = plots_dir / "recall.png"
+        g3.fig.savefig(p, dpi=150, bbox_inches="tight")
         saved.append(p)
 
     # 3. Encode/query throughput by dim (synthetic, threads=max)
@@ -407,6 +444,12 @@ def main() -> None:
     parser.add_argument("--synthetic-n-query", type=int, default=1_000)
     parser.add_argument("--skip-sift", action="store_true")
     parser.add_argument("--skip-synthetic", action="store_true")
+    parser.add_argument("--metric", choices=["l2", "cosine"], default="l2",
+                        help="distance metric; cosine applies L2-normalization "
+                             "to base/query so existing L2^2 path becomes 2(1-cos)")
+    parser.add_argument("--datasets", type=str, default="sift1m,dbpedia",
+                        help="comma-separated real datasets to benchmark "
+                             "(subset of: sift1m, dbpedia)")
     parser.add_argument("--no-show", action="store_true",
                         help="do not open plot windows")
     parser.add_argument("--output-dir", type=Path,
@@ -421,7 +464,7 @@ def main() -> None:
     plots_dir = args.output_dir / "plots"
 
     fieldnames = [
-        "dataset", "n_base", "n_query", "dim", "bits", "num_threads",
+        "dataset", "metric", "n_base", "n_query", "dim", "bits", "num_threads",
         "encode_ms", "encode_vps",
         "query_1ton_ms", "query_1ton_vps",
         "query_mton_ms", "query_mton_vps",
@@ -431,9 +474,14 @@ def main() -> None:
     rows: list[dict] = []
 
     synth_dims = [int(d) for d in args.synthetic_dims.split(",")]
+    real_datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
+    valid = {"sift1m", "dbpedia"}
+    bad = [d for d in real_datasets if d not in valid]
+    if bad:
+        raise SystemExit(f"unknown dataset(s): {bad}; valid: {sorted(valid)}")
     total_cfgs = 0
     if not args.skip_sift:
-        total_cfgs += len(bits_list) * len(threads_list)
+        total_cfgs += len(real_datasets) * len(bits_list) * len(threads_list)
     if not args.skip_synthetic:
         total_cfgs += len(synth_dims) * len(bits_list) * len(threads_list)
 
@@ -443,34 +491,38 @@ def main() -> None:
         bar = tqdm(total=total_cfgs, desc="benchmark", unit="cfg")
 
         if not args.skip_sift:
-            # base, query, gt = load_sift1m()
-            base, query, gt = load_dbpedia_single_file()
-            full_base_n = base.shape[0]
-            if args.n_base is not None:
-                base = base[: args.n_base]
-                gt_for_run = gt if args.n_base >= full_base_n else None
-            else:
-                gt_for_run = gt
-            for bits in bits_list:
-                for nt in threads_list:
-                    bar.set_postfix_str(f"sift1m bits={bits} t={nt}")
-                    row = run_config(
-                        "sift1m", base, query, gt_for_run,
-                        bits=bits, num_threads=nt,
-                        n_query_mton=args.n_query_mton,
-                        repeats=args.repeats,
-                        query_chunk=args.query_chunk,
-                    )
-                    rows.append(row)
-                    writer.writerow(row)
-                    f.flush()
-                    bar.write(
-                        f"[sift1m b={bits} t={nt}] encode={row['encode_ms']:.1f}ms "
-                        f"1-to-N={row['query_1ton_ms']:.1f}ms "
-                        f"M-to-N={row['query_mton_ms']:.1f}ms "
-                        f"recall@10={row['recall_at_10']}"
-                    )
-                    bar.update(1)
+            for ds_name in real_datasets:
+                if ds_name == "sift1m":
+                    base, query, gt = load_sift1m(metric=args.metric)
+                else:
+                    base, query, gt = load_dbpedia_single_file(metric=args.metric)
+                full_base_n = base.shape[0]
+                if args.n_base is not None:
+                    base = base[: args.n_base]
+                    gt_for_run = gt if args.n_base >= full_base_n else None
+                else:
+                    gt_for_run = gt
+                for bits in bits_list:
+                    for nt in threads_list:
+                        bar.set_postfix_str(f"{ds_name} bits={bits} t={nt}")
+                        row = run_config(
+                            ds_name, base, query, gt_for_run,
+                            bits=bits, num_threads=nt,
+                            n_query_mton=args.n_query_mton,
+                            repeats=args.repeats,
+                            query_chunk=args.query_chunk,
+                            metric=args.metric,
+                        )
+                        rows.append(row)
+                        writer.writerow(row)
+                        f.flush()
+                        bar.write(
+                            f"[{ds_name} b={bits} t={nt}] encode={row['encode_ms']:.1f}ms "
+                            f"1-to-N={row['query_1ton_ms']:.1f}ms "
+                            f"M-to-N={row['query_mton_ms']:.1f}ms "
+                            f"recall@10={row['recall_at_10']}"
+                        )
+                        bar.update(1)
 
         if not args.skip_synthetic:
             rng = np.random.default_rng(0)
@@ -488,6 +540,7 @@ def main() -> None:
                             n_query_mton=min(args.n_query_mton, args.synthetic_n_query),
                             repeats=args.repeats,
                             query_chunk=args.query_chunk,
+                            metric=args.metric,
                         )
                         rows.append(row)
                         writer.writerow(row)
