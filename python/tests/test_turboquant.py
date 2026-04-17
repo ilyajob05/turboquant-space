@@ -768,3 +768,117 @@ class TestSymmetricQJLCorrection:
               f"(relative: {rmse_light/mean_true:.4f})")
         print(f"  Full (MSE + all QJL):    {rmse_full:.2f}  "
               f"(relative: {rmse_full/mean_true:.4f})")
+
+
+# ---------------------------------------------------------------------------
+# Prepared-symmetric API: numerical equivalence with the unprepared variant.
+# The prepared path caches the query-side reconstruction + Hadamard, so for
+# every (a, b) pair it must yield the same distance (within fp32 noise) as
+# distance_m_to_n_symmetric_full([a], [b]).
+# ---------------------------------------------------------------------------
+
+class TestPreparedSymmetricEquivalence:
+
+    @pytest.mark.parametrize("bits", [4, 8])
+    @pytest.mark.parametrize("dim", [128, 1024])
+    def test_single_pair_equivalence(self, bits, dim):
+        rng = np.random.default_rng(bits * 1000 + dim)
+        n = 64
+        vecs = rng.standard_normal((n, dim)).astype(np.float32)
+        space = TQS(dim, bits_per_coord=bits)
+        codes = space.encode_batch(vecs)
+
+        # Reference: unprepared full M-to-N over all pairs.
+        ref = space.distance_m_to_n_symmetric_full(codes, codes)
+
+        # Prepared: walk each query code once, distance vs every base code.
+        # Tolerance matches the batched tests below; the two-loop unprepared
+        # path and the fused one-loop prepared path sum the four QJL terms in
+        # different orders, so float32 reordering leaks a few thousandths at
+        # dim=1024 where the result itself is ~0.3.
+        got = np.empty_like(ref)
+        for i in range(n):
+            pq = space.prepare_symmetric_query(codes[i])
+            for j in range(n):
+                got[i, j] = space.distance_symmetric_full_prepared(pq, codes[j])
+        np.testing.assert_allclose(got, ref, rtol=1e-3, atol=5e-3)
+
+    @pytest.mark.parametrize("bits", [4, 8])
+    @pytest.mark.parametrize("dim", [128, 1024])
+    def test_1_to_n_equivalence(self, bits, dim):
+        rng = np.random.default_rng(bits * 2000 + dim)
+        n = 200
+        vecs = rng.standard_normal((n, dim)).astype(np.float32)
+        space = TQS(dim, bits_per_coord=bits)
+        codes = space.encode_batch(vecs)
+
+        ref = space.distance_m_to_n_symmetric_full(codes[:1], codes)[0]
+        pq = space.prepare_symmetric_query(codes[0])
+        got = space.distance_1_to_n_symmetric_full(pq, codes)
+        np.testing.assert_allclose(got, ref, rtol=1e-4, atol=1e-3)
+
+    @pytest.mark.parametrize("bits", [4, 8])
+    @pytest.mark.parametrize("dim", [128, 1024])
+    def test_m_to_n_prepared_equivalence(self, bits, dim):
+        rng = np.random.default_rng(bits * 3000 + dim)
+        m, n = 32, 200
+        a = rng.standard_normal((m, dim)).astype(np.float32)
+        b = rng.standard_normal((n, dim)).astype(np.float32)
+        space = TQS(dim, bits_per_coord=bits)
+        ca = space.encode_batch(a)
+        cb = space.encode_batch(b)
+
+        ref = space.distance_m_to_n_symmetric_full(ca, cb)
+        got = space.distance_m_to_n_symmetric_full_prepared(ca, cb)
+        np.testing.assert_allclose(got, ref, rtol=1e-4, atol=1e-3)
+
+    @pytest.mark.parametrize("bits", [4, 8])
+    def test_self_distance_near_zero(self, bits):
+        """A code prepared and matched against itself should yield ~0."""
+        dim = 256
+        rng = np.random.default_rng(42)
+        x = rng.standard_normal(dim).astype(np.float32)
+        space = TQS(dim, bits_per_coord=bits)
+        code = space.encode(x)
+        pq = space.prepare_symmetric_query(code)
+        d = space.distance_symmetric_full_prepared(pq, code)
+        scale = float(np.sum(x * x))
+        assert d < 0.1 * scale, f"self-distance {d} too large vs |x|^2={scale}"
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("dim", [128, 1024])
+def test_prepared_symmetric_speedup(bits, dim):
+    """Microbenchmark: prepared M-to-N vs unprepared M-to-N. Reports ratio."""
+    import time
+    rng = np.random.default_rng(bits + dim)
+    m, n = 64, 2000
+    a = rng.standard_normal((m, dim)).astype(np.float32)
+    b = rng.standard_normal((n, dim)).astype(np.float32)
+    space = TQS(dim, bits_per_coord=bits)
+    ca = space.encode_batch(a)
+    cb = space.encode_batch(b)
+
+    # Warmup
+    space.distance_m_to_n_symmetric_full(ca[:4], cb[:4])
+    space.distance_m_to_n_symmetric_full_prepared(ca[:4], cb[:4])
+
+    def best_of(fn, repeats=3):
+        best = float("inf")
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            fn()
+            dt = time.perf_counter() - t0
+            best = min(best, dt)
+        return best
+
+    t_unp = best_of(lambda: space.distance_m_to_n_symmetric_full(ca, cb))
+    t_pre = best_of(lambda: space.distance_m_to_n_symmetric_full_prepared(ca, cb))
+    speedup = t_unp / t_pre
+    print(f"\n[bits={bits} dim={dim} m={m} n={n}] "
+          f"unprepared={t_unp*1000:.1f}ms  prepared={t_pre*1000:.1f}ms  "
+          f"speedup={speedup:.2f}x")
+    # Soft check: prepared should be at least as fast (allow noise).
+    assert speedup > 0.8, (
+        f"prepared was unexpectedly slower: {speedup:.2f}x"
+    )

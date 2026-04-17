@@ -31,7 +31,9 @@ dev-dependencies = [
     "seaborn",
     "matplotlib",
     "tqdm",
-    "scipy"
+    "scipy",
+    "datasets",
+    "huggingface-hub"
 ]
 package = true
 

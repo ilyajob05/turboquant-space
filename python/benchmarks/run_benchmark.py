@@ -152,6 +152,151 @@ def load_sift1m(metric: str = "l2") -> tuple[np.ndarray, np.ndarray, np.ndarray]
     return base, query, gt
 
 
+# ---------------------------------------------------------------------------
+# HuggingFace streaming loader (Cohere v3, OpenAI v3 small/large)
+# ---------------------------------------------------------------------------
+
+HF_CACHE_ROOT = Path.home() / ".cache" / "turboquant" / "hf"
+
+
+# key -> (repo_id, config, split, emb_field, dim, default_limit, source_key)
+# source_key points to the dataset whose cached .npy should be reused/truncated.
+# When source_key == key, this dataset is the source itself.
+HF_DATASETS: dict[str, dict] = {
+    "beir-msmarco": {
+        "repo": "CohereLabs/beir-embed-english-v3",
+        "config": "msmarco-corpus",
+        "split": "train",
+        "emb_field": "emb",
+        "dim": 1024,
+        "default_limit": 100_000,
+        "source_key": "beir-msmarco",
+    },
+    "openai-v3-small": {
+        "repo": "Qdrant/dbpedia-entities-openai3-text-embedding-3-small-1536-100K",
+        "config": None,
+        "split": "train",
+        "emb_field": "text-embedding-3-small-1536-embedding",
+        "dim": 1536,
+        "default_limit": 100_000,
+        "source_key": "openai-v3-small",
+    },
+    "openai-v3-large": {
+        "repo": "Qdrant/dbpedia-entities-openai3-text-embedding-3-large-3072-100K",
+        "config": None,
+        "split": "train",
+        "emb_field": "text-embedding-3-large-3072-embedding",
+        "dim": 3072,
+        "default_limit": 10_000,
+        "source_key": "openai-v3-large",
+    },
+    # Matryoshka-truncated variants of openai-v3-large. Reuse the cached
+    # 3072-dim .npy and slice to the target dimension.
+    "openai-v3-large-512": {
+        "repo": None, "config": None, "split": None, "emb_field": None,
+        "dim": 512, "default_limit": 10_000, "source_key": "openai-v3-large",
+    },
+    "openai-v3-large-1024": {
+        "repo": None, "config": None, "split": None, "emb_field": None,
+        "dim": 1024, "default_limit": 10_000, "source_key": "openai-v3-large",
+    },
+    "openai-v3-large-1536": {
+        "repo": None, "config": None, "split": None, "emb_field": None,
+        "dim": 1536, "default_limit": 10_000, "source_key": "openai-v3-large",
+    },
+}
+
+
+def _hf_cache_path(source_key: str, limit: int) -> Path:
+    return HF_CACHE_ROOT / source_key / f"embeddings_{limit}.npy"
+
+
+def _download_hf_embeddings(spec: dict, limit: int, cache_path: Path) -> np.ndarray:
+    """Stream embeddings from HF, save to .npy, return as float32 array."""
+    from datasets import load_dataset
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg = spec["config"]
+    cfg_str = f" [{cfg}]" if cfg else ""
+    print(f"[hf] streaming {spec['repo']}{cfg_str} limit={limit}")
+
+    kwargs = {"split": spec["split"], "streaming": True}
+    if spec["config"] is not None:
+        stream = load_dataset(spec["repo"], spec["config"], **kwargs)
+    else:
+        stream = load_dataset(spec["repo"], **kwargs)
+
+    embs = np.empty((limit, spec["dim"]), dtype=np.float32)
+    field = spec["emb_field"]
+    bar = tqdm(total=limit, desc=f"download {spec['repo'].split('/')[-1]}",
+               unit="vec")
+    for i, ex in enumerate(stream):
+        if i >= limit:
+            break
+        embs[i] = np.asarray(ex[field], dtype=np.float32)
+        bar.update(1)
+    bar.close()
+
+    if i + 1 < limit:
+        embs = embs[: i + 1]
+        print(f"[hf] dataset exhausted at {i + 1} vectors (asked {limit})")
+
+    np.save(cache_path, embs)
+    print(f"[hf] cached {cache_path} shape={embs.shape}")
+    return embs
+
+
+def load_hf_dataset(key: str,
+                    limit: int | None = None,
+                    n_query: int = 100,
+                    gt_k: int = 100,
+                    metric: str = "l2") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load (or download) embeddings for a registered HF dataset key.
+
+    For Matryoshka-truncated keys (source_key != key), reuses the source
+    dataset's cached .npy and slices columns [:dim].
+    """
+    spec = HF_DATASETS[key]
+    source_key = spec["source_key"]
+    source_spec = HF_DATASETS[source_key]
+    if limit is None:
+        limit = source_spec["default_limit"]
+
+    cache_path = _hf_cache_path(source_key, limit)
+    if cache_path.exists():
+        print(f"[hf] cached at {cache_path}")
+        data = np.load(cache_path)
+    else:
+        data = _download_hf_embeddings(source_spec, limit, cache_path)
+
+    # Matryoshka truncation: keep only first `dim` coordinates.
+    target_dim = spec["dim"]
+    if data.shape[1] != target_dim:
+        if target_dim > data.shape[1]:
+            raise ValueError(
+                f"{key}: requested dim={target_dim} > source dim={data.shape[1]}"
+            )
+        data = data[:, :target_dim].copy()
+        print(f"[hf] {key}: truncated to dim={target_dim}")
+
+    n_actual = data.shape[0]
+    if n_query >= n_actual:
+        raise ValueError(
+            f"{key}: n_query={n_query} >= dataset size {n_actual}"
+        )
+    query = data[:n_query].astype(np.float32, copy=False)
+    base = data[n_query:].astype(np.float32, copy=False)
+
+    if metric == "cosine":
+        base = _l2_normalize(base)
+        query = _l2_normalize(query)
+
+    print(f"[hf] {key}: computing brute-force GT (k={gt_k}) on base={base.shape}")
+    gt = _compute_gt_l2(base, query, gt_k)
+    print(f"[hf] {key}: base={base.shape} query={query.shape} gt={gt.shape}")
+    return base, query, gt
+
+
 def load_dbpedia_single_file(file_path: str = "dbpedia_openai_100K_vectors.npy",
                              n_query: int = 100,
                              gt_k: int = 100,
@@ -449,7 +594,14 @@ def main() -> None:
                              "to base/query so existing L2^2 path becomes 2(1-cos)")
     parser.add_argument("--datasets", type=str, default="sift1m,dbpedia",
                         help="comma-separated real datasets to benchmark "
-                             "(subset of: sift1m, dbpedia)")
+                             "(subset of: sift1m, dbpedia, beir-msmarco, "
+                             "openai-v3-small, openai-v3-large, "
+                             "openai-v3-large-512, openai-v3-large-1024, "
+                             "openai-v3-large-1536)")
+    parser.add_argument("--hf-limit", type=int, default=None,
+                        help="override per-dataset HF download limit "
+                             "(default: per-dataset, 100k for most, 10k for "
+                             "openai-v3-large)")
     parser.add_argument("--no-show", action="store_true",
                         help="do not open plot windows")
     parser.add_argument("--output-dir", type=Path,
@@ -475,7 +627,7 @@ def main() -> None:
 
     synth_dims = [int(d) for d in args.synthetic_dims.split(",")]
     real_datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
-    valid = {"sift1m", "dbpedia"}
+    valid = {"sift1m", "dbpedia"} | set(HF_DATASETS.keys())
     bad = [d for d in real_datasets if d not in valid]
     if bad:
         raise SystemExit(f"unknown dataset(s): {bad}; valid: {sorted(valid)}")
@@ -494,8 +646,12 @@ def main() -> None:
             for ds_name in real_datasets:
                 if ds_name == "sift1m":
                     base, query, gt = load_sift1m(metric=args.metric)
-                else:
+                elif ds_name == "dbpedia":
                     base, query, gt = load_dbpedia_single_file(metric=args.metric)
+                else:
+                    base, query, gt = load_hf_dataset(
+                        ds_name, limit=args.hf_limit, metric=args.metric,
+                    )
                 full_base_n = base.shape[0]
                 if args.n_base is not None:
                     base = base[: args.n_base]

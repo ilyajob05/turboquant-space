@@ -7,6 +7,7 @@
 namespace py = pybind11;
 using turboquant::TurboQuantSpace;
 using turboquant::TurboQuantPreparedQuery;
+using turboquant::TurboQuantPreparedSymCode;
 
 namespace {
 
@@ -53,6 +54,7 @@ PYBIND11_MODULE(_turboquant, m) {
     m.doc() = "TurboQuant — SIMD-accelerated 4/8-bit quantization for ANN";
 
     py::class_<TurboQuantPreparedQuery>(m, "PreparedQuery");
+    py::class_<TurboQuantPreparedSymCode>(m, "PreparedSymCode");
 
     py::class_<TurboQuantSpace>(m, "TurboQuantSpace")
         .def(py::init<size_t, int, uint64_t, uint64_t, int>(),
@@ -252,5 +254,66 @@ PYBIND11_MODULE(_turboquant, m) {
                  const float *q = as_float_ptr(query, self.dim(), "query", 1);
                  return self.prepareQuery(q);
              },
-             py::arg("query"));
+             py::arg("query"))
+
+        // === prepared symmetric (full QJL) ===
+        .def("prepare_symmetric_query",
+             [](const TurboQuantSpace &self, py::buffer code) {
+                 const void *c = as_bytes_ptr(code, self.codeSizeBytes(),
+                                              "code", false);
+                 return self.prepareSymmetricQuery(c);
+             },
+             py::arg("code"))
+
+        .def("distance_symmetric_full_prepared",
+             [](const TurboQuantSpace &self,
+                const TurboQuantPreparedSymCode &pq, py::buffer code_b) {
+                 const void *cb = as_bytes_ptr(code_b, self.codeSizeBytes(),
+                                               "code_b", false);
+                 return self.distanceSymmetricFullPrepared(pq, cb);
+             },
+             py::arg("pq"), py::arg("code_b"))
+
+        .def("distance_1_to_n_symmetric_full",
+             [](const TurboQuantSpace &self,
+                const TurboQuantPreparedSymCode &pq, py::buffer codes) {
+                 auto cinfo = codes.request();
+                 if (cinfo.itemsize != 1)
+                     throw py::value_error("codes must be uint8");
+                 const size_t cs = self.codeSizeBytes();
+                 ssize_t total = 1;
+                 for (auto s : cinfo.shape) total *= s;
+                 if (total % static_cast<ssize_t>(cs) != 0)
+                     throw py::value_error("codes size not a multiple of code_size_bytes");
+                 const size_t n = total / cs;
+                 auto out = py::array_t<float>(static_cast<ssize_t>(n));
+                 self.distanceBatch1ToNSymmetricFull(pq, cinfo.ptr, n,
+                                                     out.mutable_data());
+                 return out;
+             },
+             py::arg("pq"), py::arg("codes"))
+
+        .def("distance_m_to_n_symmetric_full_prepared",
+             [](const TurboQuantSpace &self, py::buffer codes_a,
+                py::buffer codes_b) {
+                 const size_t cs = self.codeSizeBytes();
+                 auto ai = codes_a.request();
+                 auto bi = codes_b.request();
+                 if (ai.itemsize != 1 || bi.itemsize != 1)
+                     throw py::value_error("codes must be uint8");
+                 ssize_t ta = 1, tb = 1;
+                 for (auto s : ai.shape) ta *= s;
+                 for (auto s : bi.shape) tb *= s;
+                 if (ta % static_cast<ssize_t>(cs) != 0 ||
+                     tb % static_cast<ssize_t>(cs) != 0)
+                     throw py::value_error("codes size not a multiple of code_size_bytes");
+                 const size_t m = ta / cs;
+                 const size_t n = tb / cs;
+                 auto out = py::array_t<float>({static_cast<ssize_t>(m),
+                                                 static_cast<ssize_t>(n)});
+                 self.distanceBatchMToNSymmetricFullPrepared(
+                     ai.ptr, m, bi.ptr, n, out.mutable_data());
+                 return out;
+             },
+             py::arg("codes_a"), py::arg("codes_b"));
 }

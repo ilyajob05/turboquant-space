@@ -144,6 +144,28 @@ struct TurboQuantPreparedQuery {
 };
 
 // ===========================================================================
+// TurboQuantPreparedSymCode — pre-computed state for full-symmetric distance
+// from one quantized code (the "query" side). Reuses the per-pair work that
+// distBuildFullScalar would otherwise repeat for every base code.
+// Holds:
+//   recon_q  — centroids[sq_idx]*sigma_q AFTER QJL Hadamard, length padded_dim
+//   sign_q   — ±1.0f sign bits, length padded_dim
+//   norm_q, gamma_q, sigma_q — scalar metadata
+//   scale_gamma_q  — space->scale() * gamma_q   (precomputed for term3)
+//   pi_over_2d_gamma_q — (π/(2d)) * gamma_q     (precomputed for term4)
+// ===========================================================================
+
+struct TurboQuantPreparedSymCode {
+    std::vector<float> recon_q;
+    std::vector<float> sign_q;
+    float norm_q;
+    float gamma_q;
+    float sigma_q;
+    float scale_gamma_q;
+    float pi_over_2d_gamma_q;
+};
+
+// ===========================================================================
 // Forward declarations
 // ===========================================================================
 
@@ -156,6 +178,7 @@ using TQDistFunc = float (*)(const void *, const void *, const void *);
 static float distSearchScalar(const void *q, const void *code_buf, const void *qty_ptr);
 static float distBuildScalar(const void *pVect1, const void *pVect2, const void *param_ptr);
 static float distBuildFullScalar(const void *pVect1, const void *pVect2, const void *param_ptr);
+static float distBuildFullPreparedScalar(const void *pq_sym, const void *code_b, const void *param_ptr);
 static float distBuildLightScalar(const void *pVect1, const void *pVect2, const void *param_ptr);
 static float distSearchScalarB4(const void *q, const void *code_buf, const void *qty_ptr);
 static float distBuildScalarB4(const void *pVect1, const void *pVect2, const void *param_ptr);
@@ -439,6 +462,87 @@ public:
         return distBuildLightScalar(code_a, code_b, this);
     }
 
+    // -- Prepared symmetric query --------------------------------------------
+
+    /// Pre-compute reconstruction + Hadamard for one quantized code, so that
+    /// it can be reused across many base codes in 1-to-N / M-to-N symmetric
+    /// full-distance loops. The base side is NOT cached — it is unpacked
+    /// inline in the hot loop to keep memory flat.
+    TurboQuantPreparedSymCode prepareSymmetricQuery(const void *code_q) const {
+        TurboQuantPreparedSymCode pq;
+        const size_t d = dim_;
+        const size_t pb = packed_bytes_;
+
+        const auto *buf = static_cast<const char *>(code_q);
+        const auto *packed = reinterpret_cast<const uint8_t *>(buf);
+        const float *meta = reinterpret_cast<const float *>(buf + pb);
+        pq.norm_q = meta[0];
+        pq.gamma_q = meta[1];
+        pq.sigma_q = meta[2];
+
+        pq.recon_q.assign(d, 0.0f);
+        pq.sign_q.assign(d, 0.0f);
+        const float sigma_q = pq.sigma_q;
+        if (packed_nibbles_) {
+            for (size_t i = 0; i < d; ++i) {
+                uint8_t byte = packed[i >> 1];
+                uint8_t u = (i & 1) ? (byte >> 4) : (byte & 0x0F);
+                pq.recon_q[i] = centroids_[u >> 1] * sigma_q;
+                pq.sign_q[i] = (u & 1) ? 1.0f : -1.0f;
+            }
+        } else {
+            for (size_t i = 0; i < d; ++i) {
+                uint8_t u = packed[i];
+                pq.recon_q[i] = centroids_[u >> 1] * sigma_q;
+                pq.sign_q[i] = (u & 1) ? 1.0f : -1.0f;
+            }
+        }
+        randomizedHadamard(pq.recon_q.data(), qjl_signs_precomp_.data(), d);
+
+        pq.scale_gamma_q = scale_ * pq.gamma_q;
+        const float pi_over_2d =
+            static_cast<float>(M_PI) / (2.0f * static_cast<float>(d));
+        pq.pi_over_2d_gamma_q = pi_over_2d * pq.gamma_q;
+        return pq;
+    }
+
+    /// Full-symmetric distance using a pre-computed query side.
+    float distanceSymmetricFullPrepared(const TurboQuantPreparedSymCode &pq,
+                                        const void *code_b) const {
+        return distBuildFullPreparedScalar(&pq, code_b, this);
+    }
+
+    /// 1-to-N full-symmetric: one prepared code × n base codes.
+    void distanceBatch1ToNSymmetricFull(const TurboQuantPreparedSymCode &pq,
+                                        const void *codes, size_t n,
+                                        float *out) const {
+        const char *base = static_cast<const char *>(codes);
+        const size_t cs = data_size_;
+        TURBOQUANT_OMP_PARALLEL_FOR(num_threads_, n)
+        for (long long i = 0; i < static_cast<long long>(n); ++i)
+            out[i] = distBuildFullPreparedScalar(
+                &pq, base + static_cast<size_t>(i) * cs, this);
+    }
+
+    /// M-to-N full-symmetric using prepared queries: prepares each of the m
+    /// query-side codes once, then loops over n base codes. Output row-major.
+    void distanceBatchMToNSymmetricFullPrepared(
+        const void *codes_a, size_t m,
+        const void *codes_b, size_t n,
+        float *out) const {
+        const char *ba = static_cast<const char *>(codes_a);
+        const char *bb = static_cast<const char *>(codes_b);
+        const size_t cs = data_size_;
+        TURBOQUANT_OMP_PARALLEL_FOR(num_threads_, m)
+        for (long long i = 0; i < static_cast<long long>(m); ++i) {
+            auto pq = prepareSymmetricQuery(ba + static_cast<size_t>(i) * cs);
+            float *row = out + static_cast<size_t>(i) * n;
+            for (size_t j = 0; j < n; ++j)
+                row[j] = distBuildFullPreparedScalar(
+                    &pq, bb + j * cs, this);
+        }
+    }
+
     // -- Batch distance -------------------------------------------------------
 
     /// 1-to-N asymmetric: one raw query against n codes.
@@ -664,6 +768,101 @@ static float distBuildFullScalar(const void *pVect1, const void *pVect2,
 
   const float ip = (ip_mse + total_correction) * norm_a * norm_b;
   return std::max(0.0f, norm_a * norm_a + norm_b * norm_b - 2.0f * ip);
+}
+
+// ---------------------------------------------------------------------------
+// Symmetric distance — full QJL correction with PREPARED query side.
+// Reuses recon_q + sign_q + scalars precomputed by prepareSymmetricQuery,
+// so the per-pair cost drops from 2 reconstructions + 2 Hadamards to
+// 1 reconstruction + 1 Hadamard for the base side only.
+// ---------------------------------------------------------------------------
+
+static float distBuildFullPreparedScalar(const void *pq_ptr,
+                                         const void *code_b,
+                                         const void *param_ptr) {
+  const auto *space = static_cast<const TurboQuantSpace *>(param_ptr);
+  const auto *pq = static_cast<const TurboQuantPreparedSymCode *>(pq_ptr);
+  const size_t dim = space->paddedDim();
+  const size_t pb = space->packedBytes();
+  const bool nibble = space->packedNibbles();
+  const float *centroids = space->centroids();
+
+  const char *buf_b = static_cast<const char *>(code_b);
+  const uint8_t *packed_b = reinterpret_cast<const uint8_t *>(buf_b);
+  const float *meta_b = reinterpret_cast<const float *>(buf_b + pb);
+  const float norm_b = meta_b[0];
+  const float gamma_b = meta_b[1];
+  const float sigma_b = meta_b[2];
+
+  const float *recon_q = pq->recon_q.data();
+  const float *sign_q = pq->sign_q.data();
+
+  // Reconstruct r̃_b from centroids (pre-Hadamard), then apply QJL Hadamard.
+  // recon_q is already POST-Hadamard from prepareSymmetricQuery.
+  std::vector<float> recon_b(dim);
+  if (nibble) {
+    for (size_t i = 0; i < dim; ++i) {
+      uint8_t byte = packed_b[i >> 1];
+      uint8_t ub = (i & 1) ? (byte >> 4) : (byte & 0x0F);
+      recon_b[i] = centroids[ub >> 1] * sigma_b;
+    }
+  } else {
+    for (size_t i = 0; i < dim; ++i) {
+      uint8_t ub = packed_b[i];
+      recon_b[i] = centroids[ub >> 1] * sigma_b;
+    }
+  }
+  randomizedHadamard(recon_b.data(), space->qjlSigns(), dim);
+
+  // All four dot products in one pass.
+  // Term 1: <recon_q, recon_b>   (Hadamard orthonormal → equals pre-Hadamard ip)
+  // Term 2: <recon_q, sign_b>    × scale * gamma_b
+  // Term 3: <sign_q, recon_b>    × scale * gamma_q   (precomputed in pq)
+  // Term 4: <sign_q, sign_b>     × (π/(2d)) * gamma_q * gamma_b   (gamma_q precomp.)
+  float dot_recon = 0.0f;
+  float dot_recon_q_sign_b = 0.0f;
+  float dot_sign_q_recon_b = 0.0f;
+  float dot_signs = 0.0f;
+  if (nibble) {
+    for (size_t i = 0; i < dim; ++i) {
+      uint8_t byte = packed_b[i >> 1];
+      uint8_t ub = (i & 1) ? (byte >> 4) : (byte & 0x0F);
+      float sb = (ub & 1) ? 1.0f : -1.0f;
+      float rq = recon_q[i];
+      float rb = recon_b[i];
+      float sq = sign_q[i];
+      dot_recon += rq * rb;
+      dot_recon_q_sign_b += rq * sb;
+      dot_sign_q_recon_b += sq * rb;
+      dot_signs += sq * sb;
+    }
+  } else {
+    for (size_t i = 0; i < dim; ++i) {
+      uint8_t ub = packed_b[i];
+      float sb = (ub & 1) ? 1.0f : -1.0f;
+      float rq = recon_q[i];
+      float rb = recon_b[i];
+      float sq = sign_q[i];
+      dot_recon += rq * rb;
+      dot_recon_q_sign_b += rq * sb;
+      dot_sign_q_recon_b += sq * rb;
+      dot_signs += sq * sb;
+    }
+  }
+
+  const float ip_mse = dot_recon;
+  const float scale = space->scale();
+  float term2 = scale * gamma_b * dot_recon_q_sign_b;
+  float term3 = pq->scale_gamma_q * dot_sign_q_recon_b;
+  float term4 = pq->pi_over_2d_gamma_q * gamma_b * dot_signs;
+
+  float total_correction = term2 + term3 + term4;
+  float max_corr = std::abs(ip_mse);
+  total_correction = std::max(-max_corr, std::min(max_corr, total_correction));
+
+  const float norm_q = pq->norm_q;
+  const float ip = (ip_mse + total_correction) * norm_q * norm_b;
+  return std::max(0.0f, norm_q * norm_q + norm_b * norm_b - 2.0f * ip);
 }
 
 // ---------------------------------------------------------------------------
