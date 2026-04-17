@@ -115,6 +115,22 @@ PYBIND11_MODULE(_turboquant, m) {
              },
              py::arg("X"), py::arg("out"))
 
+        // === diagnostic: σ-normalised post-WHT coordinates (n × padded_dim) ===
+        .def("rotated_coords_batch",
+             [](const TurboQuantSpace &self, py::buffer input) {
+                 ssize_t rows = 0;
+                 const float *data = as_float_ptr(input, self.dim(), "input", 2, &rows);
+                 const size_t n = static_cast<size_t>(rows);
+                 const size_t d = self.paddedDim();
+                 auto out = py::array_t<float>({static_cast<ssize_t>(n),
+                                                static_cast<ssize_t>(d)});
+                 self.rotatedCoordsBatch(data, n, out.mutable_data());
+                 return out;
+             },
+             py::arg("X"),
+             "Return (n, padded_dim) array of σ-normalised WHT coords. "
+             "Mirrors the first two steps of encodeVector for distribution analysis.")
+
         // === single distance (asymmetric) ===
         .def("distance",
              [](const TurboQuantSpace &self, py::buffer query, py::buffer code) {

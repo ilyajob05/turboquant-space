@@ -592,7 +592,10 @@ def main() -> None:
     parser.add_argument("--metric", choices=["l2", "cosine"], default="l2",
                         help="distance metric; cosine applies L2-normalization "
                              "to base/query so existing L2^2 path becomes 2(1-cos)")
-    parser.add_argument("--datasets", type=str, default="sift1m,dbpedia",
+    parser.add_argument("--datasets", type=str,
+                        default="sift1m,dbpedia,beir-msmarco,openai-v3-small,"
+                                "openai-v3-large,openai-v3-large-512,"
+                                "openai-v3-large-1024,openai-v3-large-1536",
                         help="comma-separated real datasets to benchmark "
                              "(subset of: sift1m, dbpedia, beir-msmarco, "
                              "openai-v3-small, openai-v3-large, "

@@ -406,6 +406,34 @@ public:
                          out + static_cast<size_t>(i) * cs);
     }
 
+    /// Fill out[n * paddedDim()] with per-vector σ-normalised post-WHT coords.
+    /// Used for distribution diagnostics — not part of the encode/search path.
+    void rotatedCoordsBatch(const float *raws, size_t n, float *out) const {
+        const size_t d = dim_;
+        TURBOQUANT_OMP_PARALLEL_FOR(num_threads_, n)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+            const size_t i = static_cast<size_t>(ii);
+            const float *raw = raws + i * input_dim_;
+            float *dst = out + i * d;
+
+            float norm_sq = 0.0f;
+            for (size_t j = 0; j < input_dim_; ++j) norm_sq += raw[j] * raw[j];
+            float inv_norm = (norm_sq > 1e-20f) ? (1.0f / std::sqrt(norm_sq)) : 0.0f;
+
+            std::vector<float> rotated(d, 0.0f);
+            for (size_t j = 0; j < input_dim_; ++j)
+                rotated[j] = raw[j] * inv_norm;
+            randomizedHadamard(rotated.data(), rotation_signs_.data(), d);
+
+            float var = 0.0f;
+            for (size_t j = 0; j < d; ++j) var += rotated[j] * rotated[j];
+            float inv_sigma = (var > 1e-20f) ? std::sqrt(static_cast<float>(d) / var) : 1.0f;
+
+            for (size_t j = 0; j < d; ++j)
+                dst[j] = rotated[j] * inv_sigma;
+        }
+    }
+
     // -- Query preparation ----------------------------------------------------
 
     TurboQuantPreparedQuery prepareQuery(const float *raw_query) const {
