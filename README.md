@@ -31,6 +31,32 @@ dists = space.distance_1_to_n(q, codes)    # (100_000,) float32
 That is the whole mental model: `encode` once, then `distance_*` against the
 codes. No index to build, no state to persist beyond `codes`.
 
+### Torch Example
+```python
+from turboquant import TurboQuantSpace
+import numpy as np
+torch.manual_seed(42)
+n, dim = 10000, 768
+x = torch.randn(n, dim)
+x = torch.nn.functional.normalize(x, dim=1)
+
+tq = TurboQuantSpace(dim=dim, bits_per_coord=8)
+
+x_np = x.detach().cpu().numpy().astype(np.float32, copy=False)
+x_np = np.ascontiguousarray(x_np)
+codes = tq.encode_batch(x_np)
+
+raw_bytes = x.numel() * 4
+comp_bytes = codes.nbytes
+print(f"raw   : {raw_bytes / 1e6:.2f} MB")
+print(f"codes : {comp_bytes / 1e6:.2f} MB  ({raw_bytes / comp_bytes:.1f}x)")
+print(f"code_size_bytes = {tq.code_size_bytes()}")
+
+q = x_np[0]
+d = tq.distance_1_to_n(q, codes)
+print("top-5 nearest:", np.argsort(d)[:5])
+
+```
 ---
 
 ## What it does, briefly
