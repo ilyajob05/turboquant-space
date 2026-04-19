@@ -29,20 +29,45 @@ target_include_directories(_turboquant PRIVATE
 )
 
 # --- OpenMP (optional) ------------------------------------------------------
-# Apple Clang ships without OpenMP; find_package can't locate Homebrew libomp
-# by itself, so we provide hints when running on macOS.
+# Apple Clang ships without OpenMP. To avoid the "multiple libomp loaded"
+# abort when torch is also imported, prefer torch's bundled libomp if
+# available; otherwise fall back to Homebrew's libomp. We still need an
+# OpenMP-capable header path for compilation.
 if(APPLE)
+    set(LIBOMP_INCLUDE_DIR "")
+    set(LIBOMP_LIBRARY "")
+
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib', 'libomp.dylib'))"
+        OUTPUT_VARIABLE TORCH_LIBOMP
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE TORCH_LIBOMP_RC
+    )
+
     execute_process(
         COMMAND brew --prefix libomp
-        OUTPUT_VARIABLE LIBOMP_PREFIX
+        OUTPUT_VARIABLE LIBOMP_BREW_PREFIX
         OUTPUT_STRIP_TRAILING_WHITESPACE
         ERROR_QUIET
         RESULT_VARIABLE LIBOMP_BREW_RC
     )
-    if(LIBOMP_BREW_RC EQUAL 0 AND EXISTS "${LIBOMP_PREFIX}")
-        set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include")
+    if(LIBOMP_BREW_RC EQUAL 0 AND EXISTS "${LIBOMP_BREW_PREFIX}/include/omp.h")
+        set(LIBOMP_INCLUDE_DIR "${LIBOMP_BREW_PREFIX}/include")
+    endif()
+
+    if(TORCH_LIBOMP_RC EQUAL 0 AND EXISTS "${TORCH_LIBOMP}")
+        set(LIBOMP_LIBRARY "${TORCH_LIBOMP}")
+        message(STATUS "Using torch-bundled libomp: ${LIBOMP_LIBRARY}")
+    elseif(LIBOMP_BREW_RC EQUAL 0 AND EXISTS "${LIBOMP_BREW_PREFIX}/lib/libomp.dylib")
+        set(LIBOMP_LIBRARY "${LIBOMP_BREW_PREFIX}/lib/libomp.dylib")
+        message(STATUS "Using Homebrew libomp: ${LIBOMP_LIBRARY}")
+    endif()
+
+    if(LIBOMP_INCLUDE_DIR AND LIBOMP_LIBRARY)
+        set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${LIBOMP_INCLUDE_DIR}")
         set(OpenMP_CXX_LIB_NAMES "omp")
-        set(OpenMP_omp_LIBRARY "${LIBOMP_PREFIX}/lib/libomp.dylib")
+        set(OpenMP_omp_LIBRARY "${LIBOMP_LIBRARY}")
     endif()
 endif()
 
@@ -51,6 +76,33 @@ if(OpenMP_CXX_FOUND)
     message(STATUS "OpenMP found: parallel batch ops enabled")
     target_link_libraries(_turboquant PRIVATE OpenMP::OpenMP_CXX)
     target_compile_definitions(_turboquant PRIVATE TURBOQUANT_HAVE_OPENMP)
+
+    # On macOS, rewrite the libomp install name in the .so so dyld resolves it
+    # via @rpath, and add rpaths to both torch's lib dir and Homebrew's libomp
+    # dir. This way torch and turboquant share the same loaded libomp instance,
+    # avoiding the "OMP: Error #15: ... already initialized" abort.
+    if(APPLE AND LIBOMP_LIBRARY)
+        # Search torch's bundled libomp first (relative to the .so's install
+        # location: site-packages/turboquant/_turboquant.so → ../torch/lib).
+        # If torch isn't installed, fall back to Homebrew's libomp via @loader_path.
+        # @loader_path lets the .so find a sibling libomp.dylib if we ever ship one.
+        set_target_properties(_turboquant PROPERTIES
+            BUILD_WITH_INSTALL_RPATH TRUE
+            INSTALL_RPATH "@loader_path/../torch/lib;@loader_path;/opt/homebrew/opt/libomp/lib;/usr/local/opt/libomp/lib"
+        )
+        add_custom_command(TARGET _turboquant POST_BUILD
+            COMMAND install_name_tool -change
+                "${LIBOMP_LIBRARY}" "@rpath/libomp.dylib"
+                "$<TARGET_FILE:_turboquant>"
+            COMMAND install_name_tool -change
+                "/opt/llvm-openmp/lib/libomp.dylib" "@rpath/libomp.dylib"
+                "$<TARGET_FILE:_turboquant>" || true
+            COMMAND install_name_tool -change
+                "/opt/homebrew/opt/libomp/lib/libomp.dylib" "@rpath/libomp.dylib"
+                "$<TARGET_FILE:_turboquant>" || true
+            COMMENT "Rewriting libomp install name to @rpath/libomp.dylib"
+        )
+    endif()
 else()
     message(STATUS "OpenMP not found: batch ops will run single-threaded")
 endif()
