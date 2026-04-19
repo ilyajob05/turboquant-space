@@ -206,6 +206,9 @@ Build flags worth knowing:
   `fno-finite-math-only` is intentional: it keeps `inf`/`nan` handling sane
   while preserving vectorization.
 
+### Recall Benchmark
+![recall](python/benchmarks/results/plots/recall.png)
+
 ### Tests
 
 ```bash
