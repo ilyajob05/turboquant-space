@@ -1,47 +1,47 @@
-# TurboQuant: почему recall < 1 при 8 битах на SIFT1M
+# TurboQuant: why recall is below 1 at 8 bits on SIFT1M
 
-## Проблема
+## Problem
 
-SIFT1M содержит uint8 дескрипторы (8 бит на координату). При квантовании с `bits_per_coord=8` ожидаем recall=1.0, наблюдаем: recall@1≈0.91, recall@10≈0.94, recall@100≈0.97.
+SIFT1M stores uint8 descriptors (8 bits per coordinate). Quantizing with `bits_per_coord=8` suggests recall of 1.0. The measured values are recall@1 ≈ 0.91, recall@10 ≈ 0.94, and recall@100 ≈ 0.97.
 
-## Причины (по убыванию влияния)
+## Causes, largest first
 
-### 1. Нормализация разрушает исходную дискретность
+### 1. Normalization destroys the original discrete grid
 
-Пайплайн: `uint8 → float / ||x|| → Hadamard → / σ → Lloyd-Max`. После деления на норму и поворота Адамара координаты становятся непрерывными float-значениями. Исходная 8-битная решётка необратимо теряется. Ранговая корреляция расстояний до и после нормализации — **0.85** (Spearman). Это главный источник потерь, но без нормализации алгоритм не работает — разделение нормы и направления необходимо для квантования.
+Pipeline: `uint8 → float / ||x|| → Hadamard → / σ → Lloyd-Max`. After the norm and the Hadamard rotation the coordinates are continuous floats. The original 8-bit lattice is gone. The rank correlation of distances before and after normalization is **0.85** (Spearman). This is the main loss. The algorithm still needs that split: the norm and the direction are quantized separately.
 
-### 2. 7 бит MSE + 1 бит QJL вместо 8 бит MSE
+### 2. 7 bits of MSE plus 1 QJL bit, instead of 8 bits of MSE
 
-При `bits_per_coord=8` алгоритм выделяет 7 бит на Lloyd-Max (128 уровней) и 1 бит на QJL-коррекцию знака residual. QJL-бит даёт +3.3% к recall@10, но 128 уровней < 256 уровней исходных данных.
+At `bits_per_coord=8` the algorithm gives 7 bits to Lloyd-Max (128 levels) and 1 bit to the QJL sign of the residual. The QJL bit adds +3.3% to recall@10, but 128 levels are fewer than the 256 levels of the source data.
 
-### 3. Гауссова модель Lloyd-Max — не баг, а фича
+### 3. The Gaussian Lloyd-Max model is the right model here
 
-Проверили data-driven Lloyd-Max (обучение на реальном распределении повёрнутых координат). При 7 битах (128 уровней) гауссова модель **лучше** эмпирической — распределение после Адамара достаточно близко к N(0,σ²). Data-driven помогает только при малом числе уровней (3 бита: +7%).
+A data-driven Lloyd-Max, trained on the real distribution of rotated coordinates, was compared with the Gaussian one. At 7 bits (128 levels) the Gaussian model is **better**. After the Hadamard the distribution is close to N(0, σ²). Data-driven centroids help only at a small number of levels (3 bits: +7%).
 
-### 4. float32 арифметика — не проблема
+### 4. float32 arithmetic does not explain the gap
 
-Сравнение float32 vs float64 пайплайнов: разница 0.00%. Точность вычислений не вносит вклада в потерю recall.
+float32 and float64 pipelines differ by 0.00%. Compute precision does not account for the lost recall.
 
-## Тесты
+## Tests
 
-| Тест | Что проверяли | Результат |
-|------|--------------|-----------|
-| QJL bit value | recall с QJL-коррекцией и без (asymmetric vs symmetric) | QJL даёт +3.3% при 8 бит, +18% при 4 бит |
-| Normalization loss | Spearman корреляция L2-расстояний до и после normalize+Hadamard | ρ=0.85, Hadamard ортогонален (ρ не меняет) |
-| float32 vs float64 | RMSE квантования в обоих пайплайнах | Разница 0% |
-| Gaussian vs empirical LM | MSE квантования: аналитический vs data-driven Lloyd-Max | 3 бит: empirical лучше на 7%. 7 бит: Gaussian лучше |
-| Distribution normality | Kurtosis, skewness повёрнутых координат | Kurtosis=0.34, skew=-0.41. Практически гауссово |
-| Symmetric QJL correction | Три варианта symmetric distance: original, light, full | Full: recall 0.908→0.937 (8 бит), RMSE −39% |
+| Test | What was checked | Result |
+|------|------------------|--------|
+| QJL bit value | recall with and without the QJL correction (asymmetric vs symmetric) | QJL adds +3.3% at 8 bits and +18% at 4 bits |
+| Normalization loss | Spearman correlation of L2 distances before and after normalize+Hadamard | ρ=0.85. The Hadamard is orthogonal, so ρ is unchanged by the rotation itself |
+| float32 vs float64 | quantization RMSE in both pipelines | 0% difference |
+| Gaussian vs empirical LM | quantization MSE: analytic vs data-driven Lloyd-Max | 3 bits: empirical is 7% better. 7 bits: Gaussian is better |
+| Distribution normality | kurtosis and skewness of rotated coordinates | kurtosis=0.34, skew=−0.41. Close to Gaussian |
+| Symmetric QJL correction | three symmetric distances: original, light, full | Full: recall 0.908→0.937 (8 bits), RMSE −39% |
 
-## Побочный результат: улучшенный symmetric distance
+## Side result: a better symmetric distance
 
-Реализовали symmetric distance с QJL-коррекцией (full-вариант). Использует все 4 члена inner product: `<r̃_a, r̃_b> + <r̃_a, e_b> + <e_a, r̃_b> + <e_a, e_b>`. Требует Hadamard на пару — O(d log d) вместо O(d), но recall почти догоняет asymmetric:
+The full symmetric distance uses the QJL correction and all four inner-product terms: `<r̃_a, r̃_b> + <r̃_a, e_b> + <e_a, r̃_b> + <e_a, e_b>`. It runs a Hadamard per pair, so the cost is O(d log d) rather than O(d). Recall then nearly matches the asymmetric distance:
 
-| bits | Original (MSE-only) | Full (MSE+QJL) | Asymmetric (ref) |
-|------|--------------------:|---------------:|------------------:|
+| bits | Original (MSE only) | Full (MSE+QJL) | Asymmetric (reference) |
+|------|--------------------:|---------------:|-----------------------:|
 | 4 | 0.198 | **0.351** | 0.379 |
 | 8 | 0.908 | **0.937** | 0.941 |
 
-## Вывод
+## Conclusion
 
-Реализация **корректна**. Recall < 1 — фундаментальное свойство пайплайна normalize→Hadamard→quantize. Основной вклад — нормализация (проекция на сферу), второстепенный — 7 бит MSE вместо 8. Потенциальное улучшение: режим 8 MSE + 0 QJL (256 уровней, без sign bit) для случаев, когда данные изначально 8-битные.
+The implementation **matches the algorithm**. Recall below 1 is a property of the normalize → Hadamard → quantize pipeline. The largest term is normalization (projection onto the sphere). The next term is 7 bits of MSE instead of 8. One possible change, for data that is already 8-bit, is a mode with 8 MSE bits and no QJL sign bit (256 levels).

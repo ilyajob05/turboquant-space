@@ -9,6 +9,8 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+# Machine-local symlink to the CMake compilation database (clangd / Serena).
+/compile_commands.json
 develop-eggs/
 dist/
 downloads/

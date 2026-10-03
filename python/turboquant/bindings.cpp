@@ -2,9 +2,11 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
-#include "turboquant/space_turbo_quant.h"
+#include "turboquant/space_turboquant.h"
+#include "turboquant/space_rabitq.h"
 
 namespace py = pybind11;
+using turboquant::RaBitQSpace;
 using turboquant::TurboQuantSpace;
 using turboquant::TurboQuantPreparedQuery;
 using turboquant::TurboQuantPreparedSymCode;
@@ -332,4 +334,84 @@ PYBIND11_MODULE(_turboquant, m) {
                  return out;
              },
              py::arg("codes_a"), py::arg("codes_b"));
+
+    py::class_<RaBitQSpace>(m, "RaBitQSpace")
+        .def(py::init([](size_t dim, uint64_t rot_seed, py::object centroid,
+                         int bits) {
+                 if (centroid.is_none())
+                     return RaBitQSpace(dim, rot_seed, nullptr, bits);
+                 py::buffer buf = py::cast<py::buffer>(centroid);
+                 const float *cp = as_float_ptr(buf, static_cast<ssize_t>(dim),
+                                                "centroid", 1);
+                 return RaBitQSpace(dim, rot_seed, cp, bits);
+             }),
+             py::arg("dim"), py::arg("rot_seed") = 42,
+             py::arg("centroid") = py::none(), py::arg("bits") = 1)
+        .def("dim", &RaBitQSpace::dim)
+        .def("padded_dim", &RaBitQSpace::paddedDim)
+        .def("bits", &RaBitQSpace::bits)
+        .def("code_size_bytes", &RaBitQSpace::codeSizeBytes)
+        .def("encode",
+             [](const RaBitQSpace &self, py::buffer input) {
+                 const float *data = as_float_ptr(input, self.dim(), "input", 1);
+                 auto code = py::array_t<uint8_t>(self.codeSizeBytes());
+                 self.encode(data, code.mutable_data());
+                 return code;
+             },
+             py::arg("x"))
+        .def("distance",
+             [](const RaBitQSpace &self, py::buffer query, py::buffer code) {
+                 const float *q = as_float_ptr(query, self.dim(), "query", 1);
+                 void *slot = as_bytes_ptr(code, self.codeSizeBytes(), "code", false);
+                 return self.distanceRaw(q, slot);
+             },
+             py::arg("query"), py::arg("code"))
+        .def("distance_scalar",
+             [](const RaBitQSpace &self, py::buffer query, py::buffer code) {
+                 const float *q = as_float_ptr(query, self.dim(), "query", 1);
+                 void *slot = as_bytes_ptr(code, self.codeSizeBytes(), "code", false);
+                 return self.distanceRawScalar(q, slot);
+             },
+             py::arg("query"), py::arg("code"))
+        .def("distance_kernel", &RaBitQSpace::distanceKernel)
+
+        .def("distance_1_to_n",
+             [](const RaBitQSpace &self, py::buffer query, py::buffer codes) {
+                 const float *q = as_float_ptr(query, self.dim(), "query", 1);
+                 auto cinfo = codes.request();
+                 if (cinfo.itemsize != 1)
+                     throw py::value_error("codes must be uint8");
+                 const size_t cs = self.codeSizeBytes();
+                 ssize_t total = 1;
+                 for (auto s : cinfo.shape) total *= s;
+                 if (cs == 0 || total % static_cast<ssize_t>(cs) != 0)
+                     throw py::value_error(
+                         "codes size not a multiple of code_size_bytes");
+                 const size_t n = static_cast<size_t>(total) / cs;
+                 auto out = py::array_t<float>(static_cast<ssize_t>(n));
+                 self.distanceBatch1ToN(q, cinfo.ptr, n, out.mutable_data());
+                 return out;
+             },
+             py::arg("query"), py::arg("codes"))
+
+        .def("distance_m_to_n",
+             [](const RaBitQSpace &self, py::buffer queries, py::buffer codes) {
+                 ssize_t m = 0;
+                 const float *q = as_float_ptr(queries, self.dim(), "queries", 2, &m);
+                 auto cinfo = codes.request();
+                 if (cinfo.itemsize != 1)
+                     throw py::value_error("codes must be uint8");
+                 const size_t cs = self.codeSizeBytes();
+                 ssize_t total = 1;
+                 for (auto s : cinfo.shape) total *= s;
+                 if (cs == 0 || total % static_cast<ssize_t>(cs) != 0)
+                     throw py::value_error(
+                         "codes size not a multiple of code_size_bytes");
+                 const size_t n = static_cast<size_t>(total) / cs;
+                 auto out = py::array_t<float>({m, static_cast<ssize_t>(n)});
+                 self.distanceBatchMToN(q, static_cast<size_t>(m), cinfo.ptr, n,
+                                        out.mutable_data());
+                 return out;
+             },
+             py::arg("queries"), py::arg("codes"));
 }

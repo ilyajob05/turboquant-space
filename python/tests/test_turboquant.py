@@ -240,16 +240,21 @@ def _simulate_turbo_quant_encode(vec, boundaries_7bit, centroids_7bit, rotation_
 
 
 def _make_rotation_signs(dim, seed=42):
-    """Reproduce the C++ splitmix64 sign generation."""
-    state = np.uint64(seed)
+    """Reproduce the C++ splitmix64 sign generation.
+
+    The multiply is modulo 2**64, same as uint64_t in RndGen64. Python ints
+    keep that wrap without NumPy's RuntimeWarning on uint64 overflow.
+    """
+    mask = (1 << 64) - 1
+    state = int(seed) & mask
     signs = np.empty(dim, dtype=np.float64)
     for i in range(dim):
-        state = np.uint64(state + np.uint64(0x9E3779B97F4A7C15))
+        state = (state + 0x9E3779B97F4A7C15) & mask
         z = state
-        z = np.uint64((z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9))
-        z = np.uint64((z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB))
-        z = z ^ (z >> np.uint64(31))
-        signs[i] = 1.0 if (z & np.uint64(1)) else -1.0
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & mask
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & mask
+        z = (z ^ (z >> 31)) & mask
+        signs[i] = 1.0 if (z & 1) else -1.0
     return signs
 
 

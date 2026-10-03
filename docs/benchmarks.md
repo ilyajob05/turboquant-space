@@ -4,7 +4,7 @@ Measured performance of `turboquant-space` across platforms. Numbers are
 raw throughput of the distance/encoding kernels — no index overhead, no
 Python-side batching tricks. See `python/benchmarks/run_benchmark.py` for
 the reproducible sweep (recall + scaling plots); the tables below come from
-`python/tests/perfomance_check.py`, which is a tighter microbenchmark
+`python/tests/performance_check.py`, which is a tighter microbenchmark
 meant for quick platform-to-platform comparison.
 
 All distance rows report a single unit — **distances/sec** — so asymmetric
@@ -13,6 +13,21 @@ rows report **vectors/sec**.
 
 Contributions of numbers from other platforms are welcome — open a PR
 adding a section below.
+
+To compare TurboQuant and RaBitQ on one machine, run
+`python/benchmarks/compare_quantizers.py`. It writes a CSV and a Markdown
+table under `python/benchmarks/results/` (gitignored). The draw is float32
+N(0, 1), shared by every row. Accuracy is recall of the asymmetric distance
+against exact squared L2, plus the mean relative error of that distance.
+Throughput uses `encode_batch` and `distance_1_to_n` for TurboQuant.
+RaBitQ search is also `distance_1_to_n` (one query preparation, then a
+C++ scan of the slots). RaBitQ encode is still one `encode` call per vector.
+`--quick` is a smoke preset; the default grid is dims 128 and 1024,
+TurboQuant at 4 and 8 bits, RaBitQ at 1, 4, and 8 bits.
+
+The run from 2026-10-03 on Darwin arm64 is checked in:
+[report](reports/compare_turboquant_rabitq_20261003.md) and
+[CSV](reports/compare_turboquant_rabitq_20261003.csv).
 
 ---
 

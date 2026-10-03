@@ -208,8 +208,10 @@ live in [`docs/benchmarks.md`](docs/benchmarks.md). Headline from M3,
 
 ```
 include/turboquant/
-  turbo_quant.h          # Hadamard, Lloyd–Max, TurboQuantCode
-  space_turbo_quant.h    # TurboQuantSpace + SIMD distance kernels
+  srht.h                 # shared SRHT: splitmix64 signs, Walsh–Hadamard, pow2 pad
+  turboquant.h           # TurboQuantCode layout
+  space_turboquant.h     # TurboQuantSpace + SIMD distance kernels
+  space_rabitq.h         # RaBitQSpace
 python/turboquant/
   bindings.cpp           # pybind11 bindings
   __init__.py
@@ -218,6 +220,8 @@ python/benchmarks/       # run_benchmark.py (CSV + seaborn plots)
 CMakeLists.txt           # scikit-build-core entry point
 pyproject.toml
 ```
+
+Header names are snake_case. The algorithm token matches the C++ namespace and the Python package (`turboquant`, `rabitq`). A space class lives in `space_<algorithm>.h`. The shared rotation is `srht.h`.
 
 The library is header-only in spirit — all algorithmic code is in
 `include/turboquant/`. Only the Python module (`bindings.cpp`) is compiled as

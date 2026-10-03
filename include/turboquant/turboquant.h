@@ -1,102 +1,23 @@
 #pragma once
-/// turbo_quant.h — TurboQuant (ICLR 2026, arXiv:2504.19874), Algorithm 2
+/// turboquant.h — TurboQuant (ICLR 2026, arXiv:2504.19874), Algorithm 2
 ///
-/// Data structures and math utilities for TurboQuant quantization.
-/// All encoding/distance/search logic lives in space_turbo_quant.h.
+/// Packed code layout (TurboQuantCode).
+/// The shared SRHT lives in srht.h.
+/// Encoding and distance live in space_turboquant.h.
 ///
 ///   byte[i] = (sq_idx << 1) | qjl_bit, 1 byte/coord
 ///   meta: [norm, gamma, sigma] = 3 x float32 immediately after packed bytes
 
-#include <cassert>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <vector>
+
+#include "srht.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
 namespace turboquant {
-
-// ===========================================================================
-// RndGen64 — splitmix64 PRNG for deterministic sign generation
-// ===========================================================================
-
-class RndGen64 {
-  uint64_t state_;
-
-public:
-  explicit RndGen64(uint64_t const seed) : state_(seed) {}
-
-  uint64_t next() {
-    uint64_t z = (state_ += 0x9e3779b97f4a7c15ULL);
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    return z ^ (z >> 31);
-  }
-};
-
-// ===========================================================================
-// Walsh-Hadamard Transform + Randomized Hadamard Transform
-// ===========================================================================
-
-// Walsh-Hadamard Transform (WHT) — scalar fallback
-inline void whtInplaceScalar(float *data, size_t const d) {
-  for (size_t step = 1; step < d; step <<= 1) {
-    const size_t jump = step << 1;
-    for (size_t i = 0; i < d; i += jump) {
-      float *__restrict__ low = &data[i];
-      float *__restrict__ high = &data[i + step];
-      for (size_t j = 0; j < step; ++j) {
-        float a = low[j];
-        float b = high[j];
-        low[j] = a + b;
-        high[j] = a - b;
-      }
-    }
-  }
-}
-
-// Walsh-Hadamard Transform (WHT)
-inline void whtInplace(float *data, size_t const d) {
-  assert(d > 0 && (d & (d - 1)) == 0 &&
-         "whtInplace: d must be a positive power of 2");
-  whtInplaceScalar(data, d);
-
-  // Normalize
-  float norm = 1.0f / std::sqrt(static_cast<float>(d));
-  for (size_t i = 0; i < d; ++i)
-    data[i] *= norm;
-}
-
-inline std::vector<float> generateSigns(size_t const d, uint64_t const seed) {
-  std::vector<float> signs(d);
-  RndGen64 rng(seed);
-  for (size_t i = 0; i < d; ++i) {
-    uint64_t bits = rng.next();
-    if (bits & 1) {
-      signs[i] = 1.0f;
-    } else {
-        signs[i] = -1.0f;
-    }
-  }
-  return signs;
-}
-
-// Randomized Walsh-Hadamard Transform. Elementwise multiply + WHT.
-inline void randomizedHadamard(float *data,
-                               const float *const __restrict__ signs,
-                               size_t const d) {
-  assert(d > 0 && (d & (d - 1)) == 0 &&
-         "randomizedHadamard: d must be a positive power of 2");
-
-  for (size_t i = 0; i < d; ++i) {
-    data[i] *= signs[i];
-  }
-  whtInplace(data, d);
-}
 
 // ===========================================================================
 //

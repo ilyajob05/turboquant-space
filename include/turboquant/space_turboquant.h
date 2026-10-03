@@ -1,5 +1,5 @@
 #pragma once
-/// space_turbo_quant.h — TurboQuant standalone space
+/// space_turboquant.h — TurboQuant standalone space
 ///
 /// Self-contained. Provides:
 ///   - TurboQuantSpace: encode float vectors into TurboQuant codes
@@ -10,9 +10,10 @@
 /// All buffers (vectors, codes, distance matrices) are owned by the caller;
 /// the library never allocates user-visible storage.
 
-#include "turbo_quant.h"
+#include "turboquant.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -230,12 +231,8 @@ class TurboQuantSpace {
     TQDistFunc fstdistfunc_build_;
 
 public:
-    static size_t roundUpPow2(size_t d) {
-        if (d <= 1) return 1;
-        size_t p = 1;
-        while (p < d) p <<= 1;
-        return p;
-    }
+    // Defined in srht.h. Qualified so this method does not call itself.
+    static size_t roundUpPow2(size_t d) { return turboquant::roundUpPow2(d); }
 
     static int resolveNumThreads(int requested) {
 #if defined(TURBOQUANT_HAVE_OPENMP)

@@ -1,164 +1,164 @@
-# TurboQuant: задача для математика
+# TurboQuant: a note for a mathematician
 
-## Контекст: что мы делаем
+## Context
 
-Мы строим систему приближённого поиска ближайших соседей (Approximate Nearest Neighbor, ANN) в больших коллекциях векторов. Вместо хранения полных float32-векторов мы **квантуем** каждый вектор в компактный код из нескольких бит на координату, а затем считаем приближённые расстояния по этим кодам.
+We are building an approximate nearest-neighbour (ANN) search over large vector collections. Instead of storing full float32 vectors we **quantize** each vector to a compact code of a few bits per coordinate, then estimate distances from those codes.
 
-Алгоритм основан на статье **TurboQuant** (ICLR 2026, arXiv:2504.19874).
+The algorithm follows **TurboQuant** (ICLR 2026, arXiv:2504.19874).
 
 ---
 
-## Архитектура алгоритма (пошагово)
+## Algorithm, step by step
 
-### Дано
+### Input
 
-Вектор $x \in \mathbb{R}^d$ (в нашем случае $d = 128$, координаты — целые числа от 0 до 255, т.е. исходные данные 8-битные).
+A vector $x \in \mathbb{R}^d$. In our case $d = 128$, and the coordinates are integers from 0 to 255, so the source data is 8-bit.
 
-### Шаг 1: Нормализация
+### Step 1: normalization
 
 $$\hat{x} = \frac{x}{\|x\|_2}$$
 
-Сохраняем $\|x\|_2$ отдельно как float32. Теперь $\hat{x}$ лежит на единичной сфере $S^{d-1}$.
+$\|x\|_2$ is stored on its own as float32. $\hat{x}$ then lies on the unit sphere $S^{d-1}$.
 
-### Шаг 2: Рандомизированное преобразование Адамара (Randomized Hadamard Transform)
+### Step 2: randomized Hadamard transform
 
 $$r = \text{WHT}(D \cdot \hat{x})$$
 
-где $D$ — диагональная матрица со случайными знаками $\pm 1$ на диагонали, $\text{WHT}$ — нормализованное преобразование Уолша-Адамара (ортогональная матрица $H / \sqrt{d}$).
+$D$ is a diagonal matrix of random signs $\pm 1$. $\text{WHT}$ is the normalized Walsh–Hadamard transform, the orthogonal matrix $H / \sqrt{d}$.
 
-**Зачем:** после этого преобразования координаты $r_i$ становятся приблизительно i.i.d. по распределению, близкому к $\mathcal{N}(0, \sigma^2)$ (по ЦПТ, т.к. каждая координата — линейная комбинация $d$ исходных координат со случайными знаками). Это позволяет использовать один и тот же скалярный квантователь для всех координат.
+**Why:** after this transform the coordinates $r_i$ are approximately i.i.d. and close to $\mathcal{N}(0, \sigma^2)$. By the central limit theorem each coordinate is a linear combination of $d$ source coordinates with random signs. One scalar quantizer can then be used for every coordinate.
 
-### Шаг 3: Вычисление глобального масштаба $\sigma$
+### Step 3: one global scale $\sigma$
 
 $$\sigma = \sqrt{\frac{1}{d} \sum_{i=1}^{d} r_i^2}$$
 
-Один скаляр на весь вектор (не per-dimension). Сохраняем как float32.
+One scalar for the whole vector, not one per dimension. Stored as float32.
 
-### Шаг 4: Скалярное квантование (Lloyd-Max для гауссиана)
+### Step 4: scalar quantization (Lloyd-Max for a Gaussian)
 
-Нормализуем координаты: $z_i = r_i / \sigma$.
+Normalize the coordinates: $z_i = r_i / \sigma$.
 
-Предполагаем $z_i \sim \mathcal{N}(0, 1)$ и применяем **оптимальный скалярный квантователь Ллойда-Макса** для этого распределения.
+Assume $z_i \sim \mathcal{N}(0, 1)$ and apply the **Lloyd-Max scalar quantizer** for that distribution.
 
-При бюджете $b$ бит на координату алгоритм отдаёт $(b-1)$ бит квантователю и $1$ бит на QJL-коррекцию (см. ниже). Таким образом:
+Of a budget of $b$ bits per coordinate, the algorithm gives $(b-1)$ bits to the quantizer and 1 bit to the QJL correction below. So:
 
-| bits_per_coord | уровней квантования | бит на QJL |
+| bits_per_coord | quantization levels | QJL bits |
 |:-:|:-:|:-:|
 | 4 | $2^3 = 8$ | 1 |
 | 8 | $2^7 = 128$ | 1 |
 
-Квантователь Ллойда-Макса: итеративно находим оптимальные границы $\{b_j\}$ и центроиды $\{c_j\}$ для $\mathcal{N}(0,1)$, минимизируя MSE:
+Lloyd-Max iteratively finds the boundaries $\{b_j\}$ and centroids $\{c_j\}$ for $\mathcal{N}(0,1)$ that minimize the MSE:
 
 $$\text{MSE} = \mathbb{E}\left[(Z - Q(Z))^2\right], \quad Z \sim \mathcal{N}(0,1)$$
 
-Каждая координата квантуется в индекс $q_i \in \{0, \ldots, 2^{b-1}-1\}$, реконструкция: $\tilde{r}_i = c_{q_i} \cdot \sigma$.
+Each coordinate becomes an index $q_i \in \{0, \ldots, 2^{b-1}-1\}$. The reconstruction is $\tilde{r}_i = c_{q_i} \cdot \sigma$.
 
-### Шаг 5: QJL-коррекция (Quantized Johnson-Lindenstrauss)
+### Step 5: QJL correction (quantized Johnson–Lindenstrauss)
 
-Вычисляем остаток (residual):
+The residual is
 
 $$e_i = r_i - \tilde{r}_i = r_i - c_{q_i} \cdot \sigma$$
 
-Применяем второе рандомизированное преобразование Адамара к вектору остатков $e$, и от результата берём только **знаковый бит** (1 бит на координату):
+A second randomized Hadamard transform is applied to $e$, and only the **sign bit** of the result is kept (1 bit per coordinate):
 
 $$s_i = \text{sign}\left(\text{WHT}(D' \cdot e)\right)_i \in \{-1, +1\}$$
 
-Также сохраняем $\gamma = \|e\|_2$ (L2-норма остатка) как float32.
+$\gamma = \|e\|_2$ is also stored as float32.
 
-**Итого на каждый вектор хранится:**
-- $d$ байт: $(q_i \ll 1) \mid s_i$ — упакованный индекс + знаковый бит
-- 3 float32: $\|x\|_2$, $\gamma$, $\sigma$
+**Stored per vector:**
+- $d$ bytes: $(q_i \ll 1) \mid s_i$, the packed index plus the sign bit
+- 3 float32 values: $\|x\|_2$, $\gamma$, $\sigma$
 
 ---
 
-## Вычисление расстояния
+## Distance
 
-### Асимметричное (query $\leftrightarrow$ code)
+### Asymmetric (query $\leftrightarrow$ code)
 
-Для запроса $q$ и закодированного вектора $x$:
+For a query $q$ and an encoded vector $x$:
 
 $$\langle q, x \rangle \approx \|q\|_2 \cdot \|x\|_2 \cdot \left(\text{ip\_mse} + \text{correction}\right)$$
 
-где:
+where
 
 $$\text{ip\_mse} = \sigma \sum_{i=1}^{d} \hat{q}^{\text{rot}}_i \cdot c_{q_i}$$
 
 $$\text{correction} = \underbrace{\sqrt{\frac{\pi}{2d}}}_{\text{scale}} \cdot \gamma \cdot \sum_{i=1}^{d} \hat{q}^{\text{qjl}}_i \cdot s_i$$
 
-$\hat{q}^{\text{rot}}$ — запрос после нормализации и Адамара (тем же seed),
-$\hat{q}^{\text{qjl}}$ — запрос после второго Адамара (seed для QJL).
+$\hat{q}^{\text{rot}}$ is the query after normalization and the Hadamard with the same seed.
+$\hat{q}^{\text{qjl}}$ is the query after the second Hadamard (the QJL seed).
 
-Финальное L2-расстояние:
+The final squared L2 distance is
 
 $$d(q, x) = \max\left(0,\ \|q\|^2 + \|x\|^2 - 2\langle q, x \rangle\right)$$
 
-### Симметричное (code $\leftrightarrow$ code)
+### Symmetric (code $\leftrightarrow$ code)
 
-При сравнении двух закодированных векторов используется **только MSE-часть**, QJL-бит игнорируется:
+A comparison of two encoded vectors uses **only the MSE part**. The QJL bit is ignored:
 
 $$\langle x_a, x_b \rangle \approx \|x_a\| \cdot \|x_b\| \cdot \sum_{i=1}^d (c_{q_i^a} \cdot \sigma_a)(c_{q_i^b} \cdot \sigma_b)$$
 
 ---
 
-## Проблема
+## Problem
 
-Датасет **SIFT1M**: 1 миллион векторов размерности 128, координаты — `uint8` (0..255). Исходные данные содержат ровно 8 бит информации на координату.
+The **SIFT1M** dataset has 1 million vectors of dimension 128. Coordinates are `uint8` (0..255). The source data carries exactly 8 bits of information per coordinate.
 
-При квантовании с `bits_per_coord = 8` мы ожидаем **recall = 1.0** (идеальное восстановление порядка ближайших соседей), потому что исходные данные сами 8-битные.
+With `bits_per_coord = 8` we expected **recall = 1.0**, a perfect recovery of neighbour order, because the source itself is 8-bit.
 
-**Наблюдаем:** recall@1 $\approx$ 0.91, recall@10 $\approx$ 0.94, recall@100 $\approx$ 0.97.
-
----
-
-## Где, по нашему мнению, может теряться точность
-
-### Гипотеза 1: 7 бит вместо 8 на квантование
-
-При $b = 8$ бит на координату, $(b-1) = 7$ бит идут на Lloyd-Max (128 уровней), 1 бит — на QJL. Исходные данные имеют 256 уровней. Возможно, при 8 битах QJL-коррекция не окупает потерю одного бита MSE.
-
-**Вопрос:** Как оптимально распределить $b$ бит между MSE-квантованием и QJL-коррекцией? Существует ли аналитическая оценка ошибки в зависимости от этого распределения?
-
-### Гипотеза 2: Глобальный $\sigma$ неоптимален
-
-Один $\sigma$ на весь вектор предполагает одинаковую дисперсию по всем координатам. После Адамара это приблизительно верно, но не точно (конечная размерность, паддинг). Может ли per-dimension масштабирование улучшить результат?
-
-**Вопрос:** Какова ожидаемая вариация $\text{Var}(r_i)$ между координатами после рандомизированного Адамара для конечного $d = 128$? Насколько это влияет на MSE квантования?
-
-### Гипотеза 3: Lloyd-Max для $\mathcal{N}(0,1)$ неточен для реального распределения
-
-После Адамара координаты приближённо гауссовы, но не точно. Хвосты и моменты высших порядков могут отличаться. При 128 уровнях квантования эти отклонения могут вносить существенную ошибку.
-
-**Вопрос:** Можно ли оценить дополнительную MSE-ошибку от несоответствия реального распределения и $\mathcal{N}(0,1)$? Как быстро это несоответствие убывает с ростом $d$?
-
-### Гипотеза 4: Формула QJL-коррекции
-
-Коэффициент $\sqrt{\pi / 2d}$ в коррекции — это $\mathbb{E}[|Z|]$ для $Z \sim \mathcal{N}(0, 1/d)$. Это приближение для оценки скалярного произведения через знаковые биты (связь с sign random projection).
-
-**Вопрос:** Верна ли эта формула для случая, когда residual $e$ уже не гауссов (т.к. это ошибка квантования, которая имеет ограниченный носитель)? Корректен ли порядок масштабирования?
-
-### Гипотеза 5: Симметричное расстояние игнорирует QJL
-
-При code-to-code сравнении QJL-бит не используется. Фактически мы тратим 1 бит из 8, который никак не участвует в вычислении. Это эквивалент 7-битного квантования.
-
-**Вопрос:** Можно ли построить корректную формулу code-to-code расстояния с использованием QJL-бит обоих векторов?
-
-### Гипотеза 6: Потеря информации при нормализации
-
-Нормализация $x / \|x\|$ отображает дискретную решётку $\{0, \ldots, 255\}^{128}$ в непрерывное множество на сфере. Обратное отображение (через $\sigma$, центроиды, $\|x\|$) не восстанавливает исходную решётку точно.
-
-**Вопрос:** Существует ли информационно-теоретическая нижняя граница на ошибку восстановления при схеме «нормализация → вращение → скалярное квантование → денормализация» для данных на целочисленной решётке?
+**Measured:** recall@1 $\approx$ 0.91, recall@10 $\approx$ 0.94, recall@100 $\approx$ 0.97.
 
 ---
 
-## Что хотелось бы получить
+## Where we think accuracy is lost
 
-1. Анализ того, какая из гипотез является **доминирующим** источником ошибки
-2. Аналитическая оценка (хотя бы по порядку) MSE или ошибки в скалярном произведении для каждого источника
-3. Рекомендации по исправлению — какие изменения в формулах дадут наибольший выигрыш
+### Hypothesis 1: 7 bits of quantization instead of 8
+
+At $b = 8$ bits per coordinate, $(b-1) = 7$ bits go to Lloyd-Max (128 levels) and 1 bit goes to QJL. The source has 256 levels. At 8 bits the QJL correction may not pay for the lost MSE bit.
+
+**Question:** How should $b$ bits be split between MSE quantization and the QJL correction? Is there an analytic error bound in terms of that split?
+
+### Hypothesis 2: one global $\sigma$ is not optimal
+
+One $\sigma$ for the whole vector assumes the same variance on every coordinate. After the Hadamard that is approximately true, but not exact (finite dimension, padding). Would a per-dimension scale help?
+
+**Question:** What is the expected variation of $\text{Var}(r_i)$ across coordinates after a randomized Hadamard at finite $d = 128$? How much does that move the quantization MSE?
+
+### Hypothesis 3: Lloyd-Max for $\mathcal{N}(0,1)$ does not match the real distribution
+
+After the Hadamard the coordinates are approximately Gaussian, not exactly. Tails and higher moments can differ. At 128 quantization levels those differences can matter.
+
+**Question:** Can the extra MSE from the gap between the real distribution and $\mathcal{N}(0,1)$ be bounded? How fast does that gap shrink as $d$ grows?
+
+### Hypothesis 4: the QJL correction formula
+
+The factor $\sqrt{\pi / 2d}$ is $\mathbb{E}[|Z|]$ for $Z \sim \mathcal{N}(0, 1/d)$. It approximates an inner product from sign bits (the same idea as a sign random projection).
+
+**Question:** Does the formula still hold when the residual $e$ is no longer Gaussian, because it is a quantization error with bounded support? Is the scaling order right?
+
+### Hypothesis 5: the symmetric distance ignores QJL
+
+Code-to-code comparison does not use the QJL bit. One of the 8 bits then takes no part in the distance. That is 7-bit quantization in practice.
+
+**Question:** Is there a correct code-to-code formula that uses the QJL bits of both vectors?
+
+### Hypothesis 6: normalization drops information
+
+$x / \|x\|$ maps the discrete lattice $\{0, \ldots, 255\}^{128}$ onto a continuous set on the sphere. The inverse map, through $\sigma$, the centroids, and $\|x\|$, does not recover that lattice exactly.
+
+**Question:** Is there an information-theoretic lower bound on the reconstruction error of "normalize → rotate → scalar-quantize → denormalize" for data on an integer lattice?
 
 ---
 
-## Ссылки
+## What would help
 
-- Статья: [TurboQuant (arXiv:2504.19874)](https://arxiv.org/abs/2504.19874)
-- Реализация: `include/turboquant/space_turbo_quant.h` (кодирование, расстояния), `include/turboquant/turbo_quant.h` (Адамар, Lloyd-Max, структуры данных)
+1. Which hypothesis is the **dominant** error source
+2. An analytic estimate, at least in order of magnitude, of the MSE or the inner-product error for each source
+3. Which formula changes would buy the most accuracy
+
+---
+
+## References
+
+- Paper: [TurboQuant (arXiv:2504.19874)](https://arxiv.org/abs/2504.19874)
+- Implementation: `include/turboquant/space_turboquant.h` (encoding and distances), `include/turboquant/turboquant.h` (code layout), `include/turboquant/srht.h` (Hadamard and signs)
