@@ -86,9 +86,12 @@
 #  include <immintrin.h>
 #endif
 
-namespace turboquant {
-
-namespace rabitq_detail {
+// RaBitQ is not nested in turboquant. A nested scope would also see
+// SRHT names, and TurboQuant names in a translation unit that includes
+// both spaces. Shared rotation is called as turboquant::.
+// turboquant::RaBitQSpace is an alias of rabitq::RaBitQSpace.
+namespace rabitq {
+namespace detail {
 
 // Which inner-product kernel a distance function instantiates.
 // The constructor picks one ISA for the whole translation unit.
@@ -388,7 +391,7 @@ inline float dot8<DotIsa::Avx2>(const float *q, const uint8_t *packed,
 }
 #endif
 
-}  // namespace rabitq_detail
+}  // namespace detail
 
 // One space: fixed centroid, fixed rotation seed, fixed bit width, fixed D.
 class RaBitQSpace {
@@ -401,7 +404,7 @@ public:
     RaBitQSpace(size_t dim, uint64_t rot_seed, const float *centroid,
                 int bits = 1, int encode_mode = -1)
         : dim_(dim),
-          padded_(roundUpPow2AtLeast4(dim)),
+          padded_(turboquant::roundUpPow2AtLeast4(dim)),
           bits_(bits),
           rot_seed_(rot_seed),
           centroid_(dim, 0.0f),
@@ -425,7 +428,7 @@ public:
             for (size_t i = 0; i < dim_; ++i)
                 centroid_[i] = centroid[i];
         }
-        signs_ = generateSigns(padded_, rot_seed_);
+        signs_ = turboquant::generateSigns(padded_, rot_seed_);
         dist_func_ = selectDist(bits_);
         if (encode_mode_ == 1)
             t_fixed_ = calibrateFixedScale();
@@ -573,12 +576,12 @@ public:
     // Same epilogue as get_dist_func(), accumulated in scalar order.
     float distancePreparedScalar(const void *prepared, const void *slot) const {
         if (bits_ == 1)
-            return distKernel<1, rabitq_detail::DotIsa::Scalar>(prepared, slot,
+            return distKernel<1, detail::DotIsa::Scalar>(prepared, slot,
                                                                this);
         if (bits_ == 4)
-            return distKernel<4, rabitq_detail::DotIsa::Scalar>(prepared, slot,
+            return distKernel<4, detail::DotIsa::Scalar>(prepared, slot,
                                                                this);
-        return distKernel<8, rabitq_detail::DotIsa::Scalar>(prepared, slot, this);
+        return distKernel<8, detail::DotIsa::Scalar>(prepared, slot, this);
     }
 
     float distanceRawScalar(const float *q, const void *slot) const {
@@ -661,7 +664,7 @@ private:
     }
 
     void rotateUnit(float *unit) const {
-        randomizedHadamard(unit, signs_.data(), padded_);
+        turboquant::randomizedHadamard(unit, signs_.data(), padded_);
     }
 
     // <ō, o> where o is the rotated unit vector and ō_i = ±1/sqrt(D).
@@ -718,7 +721,7 @@ private:
                     const float t =
                         (static_cast<float>(k) - 0.5f - center_) / oi;
                     const uint64_t key =
-                        (static_cast<uint64_t>(rabitq_detail::sortableFloat(t))
+                        (static_cast<uint64_t>(detail::sortableFloat(t))
                          << 32) |
                         static_cast<uint32_t>(i);
                     keys.push_back(key);
@@ -728,7 +731,7 @@ private:
                     const float t =
                         (static_cast<float>(m) + 0.5f - center_) / oi;
                     const uint64_t key =
-                        (static_cast<uint64_t>(rabitq_detail::sortableFloat(t))
+                        (static_cast<uint64_t>(detail::sortableFloat(t))
                          << 32) |
                         static_cast<uint32_t>(i);
                     keys.push_back(key);
@@ -736,7 +739,7 @@ private:
             }
         }
         if (keys.size() >= 4096)
-            rabitq_detail::radixSortU64(keys);
+            detail::radixSortU64(keys);
         else
             std::sort(keys.begin(), keys.end());
 
@@ -820,7 +823,7 @@ private:
         float acc = 0.0f;
         for (size_t i = 0; i < padded_; ++i) {
             const float oi = rotated_unit[i];
-            const int mag = rabitq_detail::magnitudeAtScale(
+            const int mag = detail::magnitudeAtScale(
                 std::fabs(static_cast<double>(oi)), t, max_mag);
             const int c = (oi >= 0.0f) ? start_pos + mag : start_neg - mag;
             if (c < 0 || c >= levels)
@@ -962,7 +965,7 @@ private:
         const double t_end =
             static_cast<double>(max_code + 10) / max_o;
         const double t_start =
-            t_end * static_cast<double>(rabitq_detail::tightStart(ex_bits));
+            t_end * static_cast<double>(detail::tightStart(ex_bits));
 
         using Event = std::pair<double, size_t>;
         std::vector<Event> next_t;
@@ -973,7 +976,7 @@ private:
         for (size_t i = 0; i < padded_; ++i) {
             const double magnitude =
                 std::fabs(static_cast<double>(rotated_unit[i]));
-            const int c = rabitq_detail::magnitudeAtScale(
+            const int c = detail::magnitudeAtScale(
                 magnitude, t_start, max_code);
             cur[i] = c;
             sqr += static_cast<double>(c) * static_cast<double>(c) + c;
@@ -1049,7 +1052,7 @@ private:
         std::memcpy(slot + n + sizeof(float), &dot, sizeof(float));
     }
 
-    template <int Bits, rabitq_detail::DotIsa Isa>
+    template <int Bits, detail::DotIsa Isa>
     static float distKernel(const void *prepared, const void *slot,
                             const void *param) {
         const auto *self = static_cast<const RaBitQSpace *>(param);
@@ -1076,7 +1079,7 @@ private:
         float ip = 0.0f;
         if (qnorm > 0.0f) {
             if constexpr (Bits == 1) {
-                const float acc = rabitq_detail::dot1<Isa>(
+                const float acc = detail::dot1<Isa>(
                     qrot, bytes, self->padded_, self->inv_sqrt_d_);
                 ip = acc / dot_factor;
             } else {
@@ -1084,8 +1087,8 @@ private:
                 std::memcpy(&sum_q, qrot + self->padded_ + 1, sizeof(float));
                 const float acc =
                     (Bits == 4)
-                        ? rabitq_detail::dot4<Isa>(qrot, bytes, self->padded_)
-                        : rabitq_detail::dot8<Isa>(qrot, bytes, self->padded_);
+                        ? detail::dot4<Isa>(qrot, bytes, self->padded_)
+                        : detail::dot8<Isa>(qrot, bytes, self->padded_);
                 ip = (acc - self->center_ * sum_q) / dot_factor;
             }
         }
@@ -1095,22 +1098,22 @@ private:
     static DistFunc selectDist(int bits) {
 #if defined(TURBOQUANT_RABITQ_AVX2)
         if (bits == 1)
-            return &RaBitQSpace::distKernel<1, rabitq_detail::DotIsa::Avx2>;
+            return &RaBitQSpace::distKernel<1, detail::DotIsa::Avx2>;
         if (bits == 4)
-            return &RaBitQSpace::distKernel<4, rabitq_detail::DotIsa::Avx2>;
-        return &RaBitQSpace::distKernel<8, rabitq_detail::DotIsa::Avx2>;
+            return &RaBitQSpace::distKernel<4, detail::DotIsa::Avx2>;
+        return &RaBitQSpace::distKernel<8, detail::DotIsa::Avx2>;
 #elif defined(TURBOQUANT_RABITQ_NEON)
         if (bits == 1)
-            return &RaBitQSpace::distKernel<1, rabitq_detail::DotIsa::Neon>;
+            return &RaBitQSpace::distKernel<1, detail::DotIsa::Neon>;
         if (bits == 4)
-            return &RaBitQSpace::distKernel<4, rabitq_detail::DotIsa::Neon>;
-        return &RaBitQSpace::distKernel<8, rabitq_detail::DotIsa::Neon>;
+            return &RaBitQSpace::distKernel<4, detail::DotIsa::Neon>;
+        return &RaBitQSpace::distKernel<8, detail::DotIsa::Neon>;
 #else
         if (bits == 1)
-            return &RaBitQSpace::distKernel<1, rabitq_detail::DotIsa::Scalar>;
+            return &RaBitQSpace::distKernel<1, detail::DotIsa::Scalar>;
         if (bits == 4)
-            return &RaBitQSpace::distKernel<4, rabitq_detail::DotIsa::Scalar>;
-        return &RaBitQSpace::distKernel<8, rabitq_detail::DotIsa::Scalar>;
+            return &RaBitQSpace::distKernel<4, detail::DotIsa::Scalar>;
+        return &RaBitQSpace::distKernel<8, detail::DotIsa::Scalar>;
 #endif
     }
 
@@ -1129,4 +1132,8 @@ private:
     DistFunc dist_func_ = nullptr;
 };
 
+}  // namespace rabitq
+
+namespace turboquant {
+using RaBitQSpace = rabitq::RaBitQSpace;
 }  // namespace turboquant

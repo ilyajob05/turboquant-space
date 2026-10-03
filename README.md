@@ -261,7 +261,7 @@ CMakeLists.txt           # scikit-build-core entry point
 pyproject.toml
 ```
 
-Header names are snake_case. The algorithm token matches the C++ namespace and the Python package (`turboquant`, `rabitq`). A space class lives in `space_<algorithm>.h`. The shared rotation is `srht.h`.
+Header names are snake_case. The algorithm token matches the C++ namespace and the Python package (`turboquant`, `rabitq`). A space class lives in `space_<algorithm>.h`. The shared rotation is `srht.h`. `RaBitQSpace` is `rabitq::RaBitQSpace`; `turboquant::RaBitQSpace` is an alias of that class. Its kernels live in `rabitq::detail`, which is not nested in `turboquant`.
 
 The library is header-only in spirit — all algorithmic code is in
 `include/turboquant/`. Only the Python module (`bindings.cpp`) is compiled as
