@@ -176,6 +176,46 @@ full reproduction.
 
 ---
 
+## RaBitQ
+
+`RaBitQSpace` is the other quantizer in this package. It scores asymmetric
+squared L2 on an Extended RaBitQ grid (centers 7.5 at 4 bits and 127.5 at
+8 bits), not Lloyd–Max. Legal bit widths are 1, 4, and 8. The constructor
+default is 1 bit. A zero residual raises.
+
+```python
+import numpy as np
+from turboquant import RaBitQSpace
+
+space = RaBitQSpace(dim=128, bits=4)  # 4/8-bit default: fixed_scale
+X = np.random.randn(1000, 128).astype(np.float32)
+q = np.random.randn(128).astype(np.float32)
+codes = space.encode_batch(X)          # (1000, code_size_bytes) uint8
+dists = space.distance_1_to_n(q, codes)
+```
+
+`encode_mode` selects how a 4-bit or 8-bit code is scaled. Omit it and the
+mode follows `bits`.
+
+| `encode_mode` | when it is used | what the scale is |
+|---|---|---|
+| `fixed_scale` | default at 4 and 8 bits | one positive `t` for the whole space, frozen in the constructor |
+| `windowed_scale` | pass it explicitly | one `t` per vector, inside a tight window |
+| `algorithm1` | default at 1 bit; pass it explicitly at 4 or 8 | bit-exact Extended RaBitQ sweep of every threshold |
+
+`fixed_scale()` returns that frozen `t` as a Python float. It is 0 for
+`algorithm1` and `windowed_scale`. The frozen value is the mean Algorithm 1
+plateau edge over 100 standard-normal residuals (seed 42). At 8 bits and
+dim 128 one global scale loses a little recall against `algorithm1`; the
+other measured cells stay within 0.01 recall@10. The numbers and the
+caveat are in [`docs/benchmarks.md`](docs/benchmarks.md).
+
+`fixed_scale` and `windowed_scale` with `bits=1` raise. Encode has no inner
+thread pool: one space may be called from several outer threads. The batch
+is one serial C++ pass over rows.
+
+---
+
 ## Benchmarks
 
 ```bash

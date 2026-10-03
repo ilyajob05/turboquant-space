@@ -337,16 +337,35 @@ PYBIND11_MODULE(_turboquant, m) {
 
     py::class_<RaBitQSpace>(m, "RaBitQSpace")
         .def(py::init([](size_t dim, uint64_t rot_seed, py::object centroid,
-                         int bits) {
+                         int bits, py::object encode_mode) {
+                 // None is the C++ sentinel -1: 1-bit -> algorithm1,
+                 // 4/8-bit -> fixed_scale. A string selects the mode.
+                 int mode = -1;
+                 if (!encode_mode.is_none()) {
+                     const std::string name = py::cast<std::string>(encode_mode);
+                     if (name == "algorithm1")
+                         mode = 0;
+                     else if (name == "fixed_scale")
+                         mode = 1;
+                     else if (name == "windowed_scale")
+                         mode = 2;
+                     else
+                         throw py::value_error(
+                             "encode_mode must be algorithm1, fixed_scale, "
+                             "or windowed_scale");
+                 }
                  if (centroid.is_none())
-                     return RaBitQSpace(dim, rot_seed, nullptr, bits);
+                     return RaBitQSpace(dim, rot_seed, nullptr, bits, mode);
                  py::buffer buf = py::cast<py::buffer>(centroid);
                  const float *cp = as_float_ptr(buf, static_cast<ssize_t>(dim),
                                                 "centroid", 1);
-                 return RaBitQSpace(dim, rot_seed, cp, bits);
+                 return RaBitQSpace(dim, rot_seed, cp, bits, mode);
              }),
              py::arg("dim"), py::arg("rot_seed") = 42,
-             py::arg("centroid") = py::none(), py::arg("bits") = 1)
+             py::arg("centroid") = py::none(), py::arg("bits") = 1,
+             py::arg("encode_mode") = py::none())
+        .def("encode_mode", &RaBitQSpace::encodeModeName)
+        .def("fixed_scale", &RaBitQSpace::fixedScale)
         .def("dim", &RaBitQSpace::dim)
         .def("padded_dim", &RaBitQSpace::paddedDim)
         .def("bits", &RaBitQSpace::bits)

@@ -22,7 +22,17 @@ after one warmup):
   Both spaces use rot_seed (default 42). TurboQuant keeps its default qjl_seed.
 
 Bits. TurboQuant: 4 or 8. RaBitQ: 1, 4, or 8.
-The default grid is dims {128, 1024} and every legal method/bits pair.
+RaBitQ encode modes, same slot and distance kernel:
+  rabitq:1                  sign code (algorithm1)
+  rabitq:4, rabitq:8        fixed_scale, the product default at 4 and 8 bits
+  rabitq-algorithm1:B       bit-exact Extended RaBitQ sweep
+  rabitq-fixed-scale:B      same frozen scale as bare rabitq at 4 or 8
+  rabitq-windowed-scale:B   one scale per vector, inside the tight window
+fixed_scale freezes one positive t for the space: the mean Algorithm 1
+plateau edge over 100 N(0, 1) residuals, seed 42. windowed_scale is a
+scalar next-event heap, not the library interval pruner. The default
+grid is dims {128, 1024}, both TurboQuant widths, rabitq at 1/4/8,
+the Algorithm 1 sweep at 4 and 8, and windowed_scale at 4 and 8.
 --quick is a fixed smoke preset and refuses an explicit size flag.
 
 Outputs, under --out-dir:
@@ -94,10 +104,15 @@ _CSV_FIELDS = (
 
 @dataclass(frozen=True)
 class MethodSpec:
-    """One row of the comparison grid."""
+    """One row of the comparison grid.
+
+    encode_mode is algorithm1, fixed_scale, or windowed_scale.
+    Only RaBitQ reads it. TurboQuant rows keep algorithm1 as a placeholder.
+    """
 
     name: str
     bits: int
+    encode_mode: str = "algorithm1"
 
     def encode_api(self) -> str:
         return "encode_batch"
@@ -106,8 +121,21 @@ class MethodSpec:
         return "distance_1_to_n"
 
 
+_RABITQ_MODES = {
+    "fixed-scale": "fixed_scale",
+    "windowed-scale": "windowed_scale",
+    "algorithm1": "algorithm1",
+}
+
+
 def parse_methods(text: str) -> list[MethodSpec]:
-    """Parse 'turboquant:4,rabitq:1'. Empty and unknown tokens raise ValueError."""
+    """Parse 'turboquant:4,rabitq:4,rabitq-algorithm1:8'.
+
+    Empty and unknown tokens raise ValueError. Bare rabitq:1 is algorithm1.
+    Bare rabitq at 4 or 8 bits is fixed_scale, the product default.
+    rabitq-fixed-scale and rabitq-windowed-scale accept bits 4 and 8 only.
+    rabitq-algorithm1 accepts 1, 4, and 8.
+    """
     specs: list[MethodSpec] = []
     if not text.strip():
         raise ValueError("methods is empty")
@@ -118,7 +146,18 @@ def parse_methods(text: str) -> list[MethodSpec]:
                 f"method {token!r} must look like turboquant:4 or rabitq:1"
             )
         name, bits_text = piece.split(":", 1)
-        if name not in _ALLOWED_BITS:
+        encode_mode: str | None = None
+        report_name = name
+        family = name
+        if name.startswith("rabitq-"):
+            family, _, suffix = name.partition("-")
+            if suffix not in _RABITQ_MODES:
+                raise ValueError(
+                    f"unknown RaBitQ mode {suffix!r}; expected fixed-scale, "
+                    "windowed-scale, or algorithm1"
+                )
+            encode_mode = _RABITQ_MODES[suffix]
+        if family not in _ALLOWED_BITS:
             raise ValueError(
                 f"unknown method {name!r}; expected turboquant or rabitq"
             )
@@ -126,12 +165,18 @@ def parse_methods(text: str) -> list[MethodSpec]:
             bits = int(bits_text)
         except ValueError as exc:
             raise ValueError(f"bits in {token!r} are not an integer") from exc
-        legal = _ALLOWED_BITS[name]
+        legal = _ALLOWED_BITS[family]
         if bits not in legal:
             raise ValueError(
-                f"{name} bits must be one of {legal}, got {bits}"
+                f"{family} bits must be one of {legal}, got {bits}"
             )
-        specs.append(MethodSpec(name, bits))
+        if encode_mode is None and family == "rabitq":
+            encode_mode = "fixed_scale" if bits in (4, 8) else "algorithm1"
+        if encode_mode is None:
+            encode_mode = "algorithm1"
+        if encode_mode != "algorithm1" and bits == 1:
+            raise ValueError(f"{report_name} requires bits 4 or 8, got 1")
+        specs.append(MethodSpec(report_name, bits, encode_mode))
     return specs
 
 
@@ -285,9 +330,21 @@ class RaBitQRunner:
     encode_api = "encode_batch"
     search_api = "distance_1_to_n"
 
-    def __init__(self, dim: int, bits: int, rot_seed: int) -> None:
-        self.space = RaBitQSpace(dim, rot_seed=rot_seed, bits=bits)
+    def __init__(
+        self,
+        dim: int,
+        bits: int,
+        rot_seed: int,
+        encode_mode: str | None = None,
+    ) -> None:
+        # None follows the product: fixed_scale at 4/8 bits, algorithm1 at 1.
+        if encode_mode is None:
+            encode_mode = "fixed_scale" if bits in (4, 8) else "algorithm1"
+        self.space = RaBitQSpace(
+            dim, rot_seed=rot_seed, bits=bits, encode_mode=encode_mode
+        )
         self.bits = bits
+        self.encode_mode = encode_mode
 
     @property
     def padded_dim(self) -> int:
@@ -324,7 +381,9 @@ class RaBitQRunner:
 def make_runner(spec: MethodSpec, dim: int, rot_seed: int):
     if spec.name == "turboquant":
         return TurboQuantRunner(dim, spec.bits, rot_seed)
-    return RaBitQRunner(dim, spec.bits, rot_seed)
+    if spec.name == "rabitq" or spec.name.startswith("rabitq-"):
+        return RaBitQRunner(dim, spec.bits, rot_seed, spec.encode_mode)
+    raise ValueError(f"unknown method {spec.name!r}")
 
 
 def score_method(
@@ -443,7 +502,7 @@ def write_markdown(path: Path, rows: list[dict], stamp: str, host: str) -> None:
 
 def print_table(rows: list[dict]) -> None:
     header = (
-        f"{'method':<12} {'bits':>4} {'dim':>6} {'bytes':>6} "
+        f"{'method':<22} {'bits':>4} {'dim':>6} {'bytes':>6} "
         f"{'R@1':>7} {'R@10':>7} {'rel_mae':>8} "
         f"{'encode/s':>12} {'search/s':>12}"
     )
@@ -451,7 +510,7 @@ def print_table(rows: list[dict]) -> None:
     print("-" * len(header))
     for row in rows:
         print(
-            f"{row['method']:<12} {row['bits']:4d} {row['dim']:6d} "
+            f"{row['method']:<22} {row['bits']:4d} {row['dim']:6d} "
             f"{row['code_bytes']:6d} {row['recall_at_1']:7.4f} "
             f"{row['recall_at_10']:7.4f} {row['rel_mae']:8.4f} "
             f"{row['encode_vps']:12,.0f} {row['search_pairs_per_s']:12,.0f}"
@@ -464,7 +523,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dims", default="128,1024", help="comma-separated input dims")
     parser.add_argument(
         "--methods",
-        default="turboquant:4,turboquant:8,rabitq:1,rabitq:4,rabitq:8",
+        default=(
+            "turboquant:4,turboquant:8,"
+            "rabitq:1,rabitq:4,rabitq:8,"
+            "rabitq-algorithm1:4,rabitq-algorithm1:8,"
+            "rabitq-windowed-scale:4,rabitq-windowed-scale:8"
+        ),
         help="comma-separated method:bits",
     )
     parser.add_argument("--n-base", type=int, default=2000)

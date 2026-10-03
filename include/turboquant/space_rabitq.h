@@ -39,6 +39,26 @@
 // 4-bit SIMD splits nibbles the same way as TurboQuant (low = even index)
 // and widens the RaBitQ index. It does not use Lloyd-Max centroids or the
 // QJL sign bit.
+//
+// 4/8-bit encode_mode. The constructor default is -1, resolved from bits:
+// 1-bit stays algorithm1; 4-bit and 8-bit use fixed_scale.
+//   0 algorithm1      sort every threshold. Bit-exact Extended RaBitQ
+//                     Algorithm 1. Pass 0 to keep that code at 4 or 8 bits.
+//   1 fixed_scale     one scale t frozen for the whole space, then O(1)
+//                     per coordinate. t is the mean Algorithm 1 plateau
+//                     edge over 100 N(0,1) residuals at seed 42 (not
+//                     rot_seed). This is the 4/8-bit default. At 8 bits
+//                     and dim 128 that single t does not concentrate, so
+//                     recall@10 can drop by more than 0.01 versus the sweep.
+//   2 windowed_scale  one scale per vector, inside the RaBitQ-Library
+//                     tight interval, chosen by a min-heap of the next
+//                     magnitude event. This is not the library interval
+//                     pruner. No inner thread pool: encode uses only
+//                     automatic storage, so one space may be called from
+//                     several outer threads.
+// fixed_scale and windowed_scale require bits 4 or 8. Passing either with
+// bits 1 throws. t for fixed_scale is a positive finite double, stored
+// once; the other modes leave it at 0.
 
 #include <algorithm>
 #include <cassert>
@@ -46,8 +66,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "srht.h"
@@ -122,6 +146,38 @@ inline uint32_t sortableFloat(float value) {
     std::memcpy(&bits, &value, sizeof(bits));
     const uint32_t mask = (bits & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u;
     return bits ^ mask;
+}
+
+// Magnitude on the extended grid. ex_bits = bits - 1, so max_code is
+// 7 at 4 bits and 127 at 8 bits. q = code + 0.5 matches |grid - center|
+// at centers 7.5 and 127.5. Thresholds are the integers k / magnitude,
+// the same events Algorithm 1 sorts. magnitude >= 0, t >= 0, max_code >= 0.
+inline int magnitudeAtScale(double magnitude, double t, int max_code) {
+    if (!(magnitude > 0.0) || !(t > 0.0) || max_code <= 0)
+        return 0;
+    int code = static_cast<int>(
+        std::min(t * magnitude, static_cast<double>(max_code)));
+    if (code < 0)
+        code = 0;
+    if (code < max_code &&
+        (static_cast<double>(code) + 1.0) / magnitude <= t)
+        ++code;
+    else if (code > 0 && static_cast<double>(code) / magnitude > t)
+        --code;
+    if (code < 0 || code > max_code)
+        throw std::logic_error("RaBitQ magnitudeAtScale left the grid");
+    return code;
+}
+
+// Fraction of [0, t_end] skipped before the per-vector search.
+// Index is ex_bits. 3 -> 4-bit codes (0.52), 7 -> 8-bit codes (0.77).
+// Values are the RaBitQ-Library table kTightStart.
+inline float tightStart(int ex_bits) {
+    static constexpr float kStart[9] = {
+        0.00f, 0.15f, 0.20f, 0.52f, 0.59f, 0.71f, 0.75f, 0.77f, 0.81f};
+    if (ex_bits < 0 || ex_bits >= 9)
+        throw std::invalid_argument("RaBitQ: ex_bits out of the tight-start table");
+    return kStart[ex_bits];
 }
 
 // Stable 8-bit LSD radix. Used for (threshold, coordinate) keys.
@@ -340,31 +396,55 @@ public:
     // centroid == nullptr means the zero vector of length `dim`.
     // The pointer is copied; it is not retained.
     // bits is appended so existing (dim, seed, centroid) calls stay 1-bit.
+    // encode_mode -1/0/1/2: default, algorithm1, fixed_scale, windowed_scale.
+    // -1 resolves from bits: 1 -> algorithm1, 4 or 8 -> fixed_scale.
     RaBitQSpace(size_t dim, uint64_t rot_seed, const float *centroid,
-                int bits = 1)
+                int bits = 1, int encode_mode = -1)
         : dim_(dim),
           padded_(roundUpPow2AtLeast4(dim)),
           bits_(bits),
           rot_seed_(rot_seed),
           centroid_(dim, 0.0f),
           inv_sqrt_d_(1.0f / std::sqrt(static_cast<float>(padded_))),
-          center_(bits >= 8 ? 127.5f : (bits >= 4 ? 7.5f : 0.5f)) {
+          center_(bits >= 8 ? 127.5f : (bits >= 4 ? 7.5f : 0.5f)),
+          encode_mode_(encode_mode),
+          t_fixed_(0.0) {
         if (dim_ == 0)
             throw std::invalid_argument("RaBitQ: dim must be positive");
         if (bits_ != 1 && bits_ != 4 && bits_ != 8)
             throw std::invalid_argument("RaBitQ: bits must be 1, 4, or 8");
+        if (encode_mode_ < -1 || encode_mode_ > 2)
+            throw std::invalid_argument(
+                "RaBitQ: encode_mode must be -1, 0, 1, or 2");
+        if (encode_mode_ < 0)
+            encode_mode_ = bits_ == 1 ? 0 : 1;
+        if (encode_mode_ != 0 && bits_ == 1)
+            throw std::invalid_argument(
+                "RaBitQ: fixed_scale and windowed_scale require bits 4 or 8");
         if (centroid != nullptr) {
             for (size_t i = 0; i < dim_; ++i)
                 centroid_[i] = centroid[i];
         }
         signs_ = generateSigns(padded_, rot_seed_);
         dist_func_ = selectDist(bits_);
+        if (encode_mode_ == 1)
+            t_fixed_ = calibrateFixedScale();
     }
 
     size_t dim() const { return dim_; }
     size_t paddedDim() const { return padded_; }
     int bits() const { return bits_; }
     uint64_t rotSeed() const { return rot_seed_; }
+    // "algorithm1", "fixed_scale", or "windowed_scale".
+    const char *encodeModeName() const {
+        if (encode_mode_ == 1)
+            return "fixed_scale";
+        if (encode_mode_ == 2)
+            return "windowed_scale";
+        return "algorithm1";
+    }
+    // Frozen scale of fixed_scale. 0 for algorithm1 and windowed_scale.
+    double fixedScale() const { return t_fixed_; }
 
     // Bytes of one data slot.
     size_t codeSizeBytes() const { return payloadBytes() + 2 * sizeof(float); }
@@ -428,13 +508,19 @@ public:
         }
 
         std::vector<uint8_t> codes(padded_);
-        const float dot = quantizeExtended(rotated.data(), codes.data());
+        float dot = 0.0f;
+        if (encode_mode_ == 1)
+            dot = quantizeFixedScale(rotated.data(), codes.data());
+        else if (encode_mode_ == 2)
+            dot = quantizeWindowedScale(rotated.data(), codes.data());
+        else
+            dot = quantizeExtended(rotated.data(), codes.data());
         packCodes(codes.data(), norm, dot, bytes);
     }
 
-    // Row-major [n, dim] into n packed slots. One C++ pass, same encode as
-    // the single-vector call. Serial on purpose: encode throws, and that
-    // exception must not leave an OpenMP worker.
+    // Row-major [n, dim] into n packed slots. One serial pass, same encode
+    // as the single-vector call. No inner thread pool: the caller is already
+    // threaded, and a throw stays on this thread.
     void encodeBatch(const float *raws, size_t n, void *out) const {
         if (out == nullptr || (n > 0 && raws == nullptr))
             throw std::invalid_argument("RaBitQ encodeBatch: null pointer");
@@ -720,6 +806,232 @@ private:
         return acc;
     }
 
+    // Grid index from a positive scale. o >= 0 maps to [2^{B-1}, 2^B).
+    // o < 0 maps to [0, 2^{B-1}). |code - center| = magnitude + 0.5.
+    float emitGrid(const float *rotated_unit, uint8_t *codes, double t) const {
+        const int levels = 1 << bits_;
+        const int max_mag = (levels >> 1) - 1;
+        const int start_pos = levels >> 1;
+        const int start_neg = start_pos - 1;
+        if (!(t > 0.0) || !std::isfinite(t))
+            throw std::invalid_argument(
+                "RaBitQ encode: scale is not positive, padded_dim=" +
+                std::to_string(padded_));
+        float acc = 0.0f;
+        for (size_t i = 0; i < padded_; ++i) {
+            const float oi = rotated_unit[i];
+            const int mag = rabitq_detail::magnitudeAtScale(
+                std::fabs(static_cast<double>(oi)), t, max_mag);
+            const int c = (oi >= 0.0f) ? start_pos + mag : start_neg - mag;
+            if (c < 0 || c >= levels)
+                throw std::logic_error(
+                    "RaBitQ quantize: code left the grid, padded_dim=" +
+                    std::to_string(padded_));
+            codes[i] = static_cast<uint8_t>(c);
+            acc += (static_cast<float>(c) - center_) * oi;
+        }
+        if (!(acc > 0.0f) && !(acc < 0.0f))
+            throw std::invalid_argument(
+                "RaBitQ encode: dot_factor is 0, padded_dim=" +
+                std::to_string(padded_));
+        return acc;
+    }
+
+    float quantizeFixedScale(const float *rotated_unit, uint8_t *codes) const {
+        return emitGrid(rotated_unit, codes, t_fixed_);
+    }
+
+    // Left edge of the Algorithm 1 plateau that produced `codes`.
+    // The last applied threshold is the max t among coordinates that left
+    // the initial rounding. If none did, the edge is half the next threshold.
+    double scaleOfCodes(const float *rotated_unit,
+                        const uint8_t *codes) const {
+        const int levels = 1 << bits_;
+        const int start_pos = levels >> 1;
+        const int start_neg = start_pos - 1;
+        float max_t = 0.0f;
+        bool any = false;
+        float next_t = std::numeric_limits<float>::infinity();
+        for (size_t i = 0; i < padded_; ++i) {
+            const float oi = rotated_unit[i];
+            const int c = static_cast<int>(codes[i]);
+            if (oi > 0.0f) {
+                if (c < start_pos || c >= levels)
+                    throw std::logic_error(
+                        "RaBitQ fixed scale: positive code left the ray");
+                if (c > start_pos) {
+                    const float t =
+                        (static_cast<float>(c) - 0.5f - center_) / oi;
+                    if (!any || t > max_t)
+                        max_t = t;
+                    any = true;
+                }
+                if (c + 1 < levels) {
+                    const float t =
+                        (static_cast<float>(c + 1) - 0.5f - center_) / oi;
+                    if (t < next_t)
+                        next_t = t;
+                }
+            } else if (oi < 0.0f) {
+                if (c < 0 || c > start_neg)
+                    throw std::logic_error(
+                        "RaBitQ fixed scale: negative code left the ray");
+                if (c < start_neg) {
+                    const float t =
+                        (static_cast<float>(c) + 0.5f - center_) / oi;
+                    if (!any || t > max_t)
+                        max_t = t;
+                    any = true;
+                }
+                if (c > 0) {
+                    const float t =
+                        (static_cast<float>(c - 1) + 0.5f - center_) / oi;
+                    if (t < next_t)
+                        next_t = t;
+                }
+            }
+        }
+        if (any)
+            return static_cast<double>(max_t);
+        if (std::isfinite(next_t) && next_t > 0.0f)
+            return 0.5 * static_cast<double>(next_t);
+        throw std::invalid_argument(
+            "RaBitQ fixed scale: no threshold, padded_dim=" +
+            std::to_string(padded_));
+    }
+
+    // Mean Algorithm 1 scale on 100 standard-normal residuals. Seed 42 is
+    // the library's calibration seed and does not depend on rot_seed.
+    // The residual is padded, normalized, and rotated the same way encode is.
+    double calibrateFixedScale() const {
+        constexpr int kCount = 100;
+        std::mt19937_64 rng(42);
+        std::normal_distribution<float> normal(0.0f, 1.0f);
+        std::vector<float> rotated(padded_, 0.0f);
+        std::vector<uint8_t> codes(padded_);
+        double sum = 0.0;
+        int used = 0;
+        for (int n = 0; n < kCount; ++n) {
+            std::fill(rotated.begin(), rotated.end(), 0.0f);
+            float norm = 0.0f;
+            for (size_t i = 0; i < dim_; ++i) {
+                const float v = normal(rng);
+                rotated[i] = v;
+                norm += v * v;
+            }
+            norm = std::sqrt(norm);
+            if (!(norm > 0.0f))
+                continue;
+            const float inv = 1.0f / norm;
+            for (size_t i = 0; i < dim_; ++i)
+                rotated[i] *= inv;
+            rotateUnit(rotated.data());
+            try {
+                quantizeExtended(rotated.data(), codes.data());
+            } catch (const std::invalid_argument &) {
+                continue;
+            }
+            sum += scaleOfCodes(rotated.data(), codes.data());
+            ++used;
+        }
+        if (used == 0)
+            throw std::invalid_argument(
+                "RaBitQ fixed scale: calibration produced no vector, padded_dim=" +
+                std::to_string(padded_));
+        const double t = sum / static_cast<double>(used);
+        if (!(t > 0.0) || !std::isfinite(t))
+            throw std::invalid_argument(
+                "RaBitQ fixed scale: t_fixed is not positive, padded_dim=" +
+                std::to_string(padded_));
+        return t;
+    }
+
+    // windowed_scale: min-heap of the next magnitude step inside [t_start, t_end).
+    // Score is N/sqrt(S) with q_i = magnitude_i + 0.5, the same argmax as
+    // Algorithm 1's squared cosine. One live event per coordinate.
+    double bestWindowedScale(const float *rotated_unit) const {
+        const int ex_bits = bits_ - 1;
+        const int max_code = (1 << ex_bits) - 1;
+        double max_o = 0.0;
+        for (size_t i = 0; i < padded_; ++i)
+            max_o = std::max(max_o, std::fabs(static_cast<double>(rotated_unit[i])));
+        if (!(max_o > 0.0))
+            throw std::invalid_argument(
+                "RaBitQ encode: rotated residual is 0, padded_dim=" +
+                std::to_string(padded_));
+        const double t_end =
+            static_cast<double>(max_code + 10) / max_o;
+        const double t_start =
+            t_end * static_cast<double>(rabitq_detail::tightStart(ex_bits));
+
+        using Event = std::pair<double, size_t>;
+        std::vector<Event> next_t;
+        next_t.reserve(padded_);
+        std::vector<int> cur(padded_);
+        double sqr = static_cast<double>(padded_) * 0.25;
+        double num = 0.0;
+        for (size_t i = 0; i < padded_; ++i) {
+            const double magnitude =
+                std::fabs(static_cast<double>(rotated_unit[i]));
+            const int c = rabitq_detail::magnitudeAtScale(
+                magnitude, t_start, max_code);
+            cur[i] = c;
+            sqr += static_cast<double>(c) * static_cast<double>(c) + c;
+            num += (static_cast<double>(c) + 0.5) * magnitude;
+            if (magnitude > 0.0 && c < max_code) {
+                const double nxt = static_cast<double>(c + 1) / magnitude;
+                if (nxt < t_end)
+                    next_t.emplace_back(nxt, i);
+            }
+        }
+        std::make_heap(next_t.begin(), next_t.end(), std::greater<Event>{});
+        double max_ip = num / std::sqrt(sqr);
+        double best_t = t_start;
+        while (!next_t.empty()) {
+            const double cur_t = next_t.front().first;
+            do {
+                const size_t i = next_t.front().second;
+                ++cur[i];
+                sqr += 2.0 * static_cast<double>(cur[i]);
+                const double magnitude =
+                    std::fabs(static_cast<double>(rotated_unit[i]));
+                num += magnitude;
+                Event next{t_end, i};
+                if (cur[i] < max_code)
+                    next.first = static_cast<double>(cur[i] + 1) / magnitude;
+                if (next.first >= t_end) {
+                    next = next_t.back();
+                    next_t.pop_back();
+                }
+                if (!next_t.empty()) {
+                    size_t parent = 0;
+                    size_t child = 1;
+                    while (child < next_t.size()) {
+                        if (child + 1 < next_t.size() &&
+                            next_t[child + 1] < next_t[child])
+                            ++child;
+                        if (!(next_t[child] < next))
+                            break;
+                        next_t[parent] = next_t[child];
+                        parent = child;
+                        child = 2 * parent + 1;
+                    }
+                    next_t[parent] = next;
+                }
+            } while (!next_t.empty() && next_t.front().first == cur_t);
+            const double cur_ip = num / std::sqrt(sqr);
+            if (cur_ip > max_ip) {
+                max_ip = cur_ip;
+                best_t = cur_t;
+            }
+        }
+        return best_t;
+    }
+
+    float quantizeWindowedScale(const float *rotated_unit, uint8_t *codes) const {
+        return emitGrid(rotated_unit, codes, bestWindowedScale(rotated_unit));
+    }
+
     void packCodes(const uint8_t *codes, float norm, float dot,
                    uint8_t *slot) const {
         const size_t n = payloadBytes();
@@ -812,6 +1124,8 @@ private:
     std::vector<float> centroid_;
     float inv_sqrt_d_;
     float center_;
+    int encode_mode_;
+    double t_fixed_;
     DistFunc dist_func_ = nullptr;
 };
 

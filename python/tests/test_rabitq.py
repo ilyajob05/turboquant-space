@@ -403,7 +403,9 @@ def test_extended_encode_matches_oracle(dim, bits):
     seed = 42
     rng = np.random.default_rng(2000 + dim * 10 + bits)
     centroid = rng.standard_normal(dim).astype(np.float32)
-    space = RaBitQSpace(dim, rot_seed=seed, centroid=centroid, bits=bits)
+    space = RaBitQSpace(
+        dim, rot_seed=seed, centroid=centroid, bits=bits, encode_mode="algorithm1"
+    )
     payload = padded_dim(dim) if bits == 8 else padded_dim(dim) // 2
     for _ in range(4):
         x = rng.standard_normal(dim).astype(np.float32)
@@ -423,6 +425,8 @@ def test_extended_distance_matches_oracle(dim, bits):
     seed = 42
     rng = np.random.default_rng(3000 + dim * 10 + bits)
     centroid = rng.standard_normal(dim).astype(np.float32) * np.float32(0.1)
+    # Default 4/8-bit encode is fixed_scale. The oracle reads the stored
+    # grid, so this checks the distance of that code, not Algorithm 1 bytes.
     space = RaBitQSpace(dim, rot_seed=seed, centroid=centroid, bits=bits)
     # D < 16 stays on the scalar tail for 4-bit NEON. Wider D exercises vmla.
     repeats = 8 if dim >= 128 else 4
@@ -433,3 +437,118 @@ def test_extended_distance_matches_oracle(dim, bits):
         got = space.distance(q, code)
         expect = oracle_distance_extended(q, code, seed, centroid, bits)
         np.testing.assert_allclose(got, expect, rtol=1e-4, atol=1e-3)
+
+
+def _unpack_grid(slot, bits, padded):
+    """Grid index per padded coordinate. 4-bit: low nibble is the even index."""
+    if bits == 8:
+        return slot[:padded].astype(np.int32)
+    codes = np.empty(padded, np.int32)
+    for i in range(padded):
+        byte = int(slot[i >> 1])
+        codes[i] = (byte >> 4) & 0x0F if (i & 1) else byte & 0x0F
+    return codes
+
+
+def _rotated_unit(vec, seed, centroid):
+    unit, norm = residual_unit(vec, centroid)
+    rot = wht_f32(unit * splitmix_signs(padded_dim(vec.shape[0]), seed))
+    return rot, norm
+
+
+@pytest.mark.parametrize("mode", ["fixed_scale", "windowed_scale"])
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("dim", [8, 32])
+def test_fast_encode_matches_grid_dot(mode, bits, dim):
+    seed = 42
+    rng = np.random.default_rng(
+        4000 + dim * 10 + bits + (0 if mode == "fixed_scale" else 1)
+    )
+    centroid = rng.standard_normal(dim).astype(np.float32) * np.float32(0.1)
+    space = RaBitQSpace(
+        dim, rot_seed=seed, centroid=centroid, bits=bits, encode_mode=mode
+    )
+    assert space.encode_mode() == mode
+    if mode == "fixed_scale":
+        assert space.fixed_scale() > 0.0
+    else:
+        assert space.fixed_scale() == 0.0
+    center = np.float32(7.5 if bits == 4 else 127.5)
+    D = int(space.padded_dim())
+    for _ in range(3):
+        x = rng.standard_normal(dim).astype(np.float32)
+        slot = np.asarray(space.encode(x), dtype=np.uint8)
+        batch = np.asarray(space.encode_batch(x[None, :]), dtype=np.uint8)
+        np.testing.assert_array_equal(batch[0], slot)
+        codes = _unpack_grid(slot, bits, D)
+        assert codes.min() >= 0
+        assert codes.max() <= (15 if bits == 4 else 255)
+        rot, norm = _rotated_unit(x, seed, centroid)
+        acc = np.float32(0.0)
+        for i in range(D):
+            acc = np.float32(
+                acc + np.float32(np.float32(codes[i]) - center) * rot[i]
+            )
+        meta = np.frombuffer(slot[-8:].tobytes(), dtype=np.float32)
+        np.testing.assert_allclose(meta[0], norm, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(meta[1], acc, rtol=1e-4, atol=1e-4)
+        q = rng.standard_normal(dim).astype(np.float32)
+        dist = float(space.distance(q, slot))
+        assert np.isfinite(dist)
+
+
+def test_default_encode_mode_follows_bits():
+    """Omitted encode_mode is algorithm1 at 1 bit and fixed_scale at 4/8."""
+    rng = np.random.default_rng(7)
+    x = rng.standard_normal(16).astype(np.float32)
+    one = RaBitQSpace(16, rot_seed=42)
+    assert one.encode_mode() == "algorithm1"
+    assert one.fixed_scale() == 0.0
+    explicit_one = RaBitQSpace(16, rot_seed=42, bits=1)
+    assert explicit_one.encode_mode() == "algorithm1"
+    np.testing.assert_array_equal(one.encode(x), explicit_one.encode(x))
+    default4 = RaBitQSpace(16, rot_seed=42, bits=4)
+    named4 = RaBitQSpace(16, rot_seed=42, bits=4, encode_mode="fixed_scale")
+    assert default4.encode_mode() == "fixed_scale"
+    assert default4.fixed_scale() > 0.0
+    np.testing.assert_allclose(default4.fixed_scale(), named4.fixed_scale())
+    np.testing.assert_array_equal(default4.encode(x), named4.encode(x))
+    sweep = RaBitQSpace(16, rot_seed=42, bits=4, encode_mode="algorithm1")
+    assert sweep.encode_mode() == "algorithm1"
+    assert sweep.fixed_scale() == 0.0
+    assert RaBitQSpace(16, bits=8).encode_mode() == "fixed_scale"
+
+
+def test_encode_mode_rejects_unknown_and_1bit():
+    with pytest.raises(ValueError):
+        RaBitQSpace(16, bits=4, encode_mode="lloyd")
+    with pytest.raises(ValueError):
+        RaBitQSpace(16, bits=4, encode_mode="const_t")
+    with pytest.raises(ValueError):
+        RaBitQSpace(16, bits=4, encode_mode="window")
+    with pytest.raises(ValueError):
+        RaBitQSpace(16, bits=1, encode_mode="fixed_scale")
+    with pytest.raises(ValueError):
+        RaBitQSpace(16, bits=1, encode_mode="windowed_scale")
+
+
+def test_fixed_scale_encode_is_reentrant():
+    dim = 32
+    space = RaBitQSpace(dim, rot_seed=1, bits=4, encode_mode="fixed_scale")
+    rng = np.random.default_rng(5)
+    xs = rng.standard_normal((8, dim)).astype(np.float32)
+    serial = np.asarray(space.encode_batch(xs))
+    import threading
+
+    out = [None] * 8
+
+    def work(i):
+        out[i] = np.asarray(space.encode(xs[i]))
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    for i in range(8):
+        np.testing.assert_array_equal(out[i], serial[i])

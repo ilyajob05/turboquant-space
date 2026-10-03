@@ -23,15 +23,55 @@ Throughput uses `encode_batch` and `distance_1_to_n` for both
 quantizers. TurboQuant's batch is an OpenMP loop (`num_threads=1` in
 this comparison). RaBitQ's batch is one serial C++ pass: its encode
 throws on a zero residual, so that pass does not enter an OpenMP worker.
-RaBitQ 4-bit and 8-bit codes still follow Extended RaBitQ Algorithm 1.
-The critical values are ordered by `(threshold, coordinate)`: a radix
-sort when there are at least 4096 of them, and `std::sort` below that.
-`--quick` is a smoke preset; the default grid is dims 128 and 1024,
-TurboQuant at 4 and 8 bits, RaBitQ at 1, 4, and 8 bits.
+RaBitQ chooses the 4/8-bit grid scale with `encode_mode`. When the
+argument is omitted, the mode follows the bit width: 1-bit is the sign
+code (`algorithm1`); 4-bit and 8-bit use `fixed_scale`.
 
-The run from 2026-10-03 on Darwin arm64 is checked in:
-[report](reports/compare_turboquant_rabitq_20261003.md) and
-[CSV](reports/compare_turboquant_rabitq_20261003.csv).
+`fixed_scale` freezes one positive scale for the whole space. That scale
+is the mean Algorithm 1 plateau edge over 100 standard-normal residuals
+(seed 42, independent of `rot_seed`). Each coordinate is then O(1):
+multiply `|o_i|` by `t`, clamp onto the magnitude grid, and step by one
+when `(code / |o_i|)` falls on the other side of `t`. `windowed_scale`
+picks one scale per vector inside the RaBitQ-Library tight interval, with
+a scalar heap of the next magnitude event on each coordinate. That heap is not the library's
+interval pruner. `algorithm1` is the bit-exact Extended RaBitQ sweep:
+every threshold, ordered by `(threshold, coordinate)`, a radix sort when
+there are at least 4096 keys and `std::sort` below that. Pass
+`encode_mode="algorithm1"` to keep that code at 4 or 8 bits.
+`fixed_scale` and `windowed_scale` accept only bits 4 and 8.
+
+On the 2026-10-03 Darwin arm64 grid (`n_base=2000`, `n_query=40`,
+`n_speed=400`, `k=10`), `fixed_scale` encode was about 0.9× TurboQuant at
+4 bits and about 3× TurboQuant at 8 bits. Recall@10 stayed within 0.01 of
+the sweep, except at 8 bits and dim 128. There recall@10 drops by about 0.02 (0.9725 versus 0.9950) and
+the relative distance error is larger than TurboQuant at the same width.
+`windowed_scale` keeps the 8-bit recall and is several times faster than
+the sweep, still well below TurboQuant. Search throughput does not depend
+on the encode mode. Building a `fixed_scale` space runs the 100-vector
+calibration before any timed encode.
+
+Benchmark tokens follow that default. `rabitq:1` is the sign code.
+`rabitq:4` and `rabitq:8` are `fixed_scale`. `rabitq-algorithm1:B` is the
+sweep. `rabitq-windowed-scale:B` is the per-vector scale.
+`rabitq-fixed-scale:B` names the same mode as bare `rabitq` at 4 or 8 bits.
+`--quick` is a smoke preset. The default grid is dims 128 and 1024,
+TurboQuant at 4 and 8 bits, RaBitQ at 1, 4, and 8 bits, plus the sweep
+and `windowed_scale` at 4 and 8 bits.
+
+Two runs from that day are checked in:
+
+- Algorithm 1 sweep, stamp `20261003T134329Z`:
+  [report](reports/compare_turboquant_rabitq_20261003.md),
+  [CSV](reports/compare_turboquant_rabitq_20261003.csv).
+  The `rabitq` rows at 4 and 8 bits in that file are the sweep. They are
+  not the current 4/8-bit default.
+- Encode-mode comparison, stamp `20261003T194028Z`:
+  [report](reports/compare_turboquant_rabitq_encode_20261003.md),
+  [CSV](reports/compare_turboquant_rabitq_encode_20261003.csv).
+  Names in that file were aligned with the API after the run; the codes
+  and the rates are the measured ones. `rabitq-algorithm1` is the sweep,
+  `rabitq-fixed-scale` is the frozen scale, and `rabitq-windowed-scale`
+  is the per-vector heap.
 
 ---
 
