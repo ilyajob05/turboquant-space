@@ -14,11 +14,11 @@ Accuracy (n_base vectors, n_query queries):
 
 Throughput (a separate draw of n_speed vectors, one query, min of --repeats
 after one warmup):
-  turboquant encode  -> encode_batch
-  turboquant search  -> distance_1_to_n
-  rabitq encode      -> encode, one vector per call
-  rabitq search      -> distance_1_to_n
-  TurboQuant is constructed with num_threads=1. RaBitQ has no thread argument.
+  both encodes       -> encode_batch
+  both searches      -> distance_1_to_n
+  TurboQuant is constructed with num_threads=1. RaBitQ encode_batch is
+  one serial C++ pass: encode can throw, so it does not use the OpenMP
+  pool TurboQuant uses for Lloyd-Max.
   Both spaces use rot_seed (default 42). TurboQuant keeps its default qjl_seed.
 
 Bits. TurboQuant: 4 or 8. RaBitQ: 1, 4, or 8.
@@ -100,7 +100,7 @@ class MethodSpec:
     bits: int
 
     def encode_api(self) -> str:
-        return "encode_batch" if self.name == "turboquant" else "encode"
+        return "encode_batch"
 
     def search_api(self) -> str:
         return "distance_1_to_n"
@@ -280,9 +280,9 @@ class TurboQuantRunner:
 
 
 class RaBitQRunner:
-    """Encode is one call per vector. Search prepares the query once."""
+    """Encode and search each take one C++ pass over the rows."""
 
-    encode_api = "encode"
+    encode_api = "encode_batch"
     search_api = "distance_1_to_n"
 
     def __init__(self, dim: int, bits: int, rot_seed: int) -> None:
@@ -306,15 +306,10 @@ class RaBitQRunner:
         return str(self.space.distance_kernel())
 
     def encode(self, vectors: np.ndarray) -> np.ndarray:
-        n = vectors.shape[0]
-        codes = np.empty((n, self.code_bytes), dtype=np.uint8)
-        for i in range(n):
-            slot = np.asarray(self.space.encode(vectors[i]), dtype=np.uint8)
-            if slot.shape != (self.code_bytes,):
-                raise RuntimeError(
-                    f"encode returned {slot.shape}, expected {(self.code_bytes,)}"
-                )
-            codes[i] = slot
+        codes = np.asarray(self.space.encode_batch(vectors), dtype=np.uint8)
+        expected = (vectors.shape[0], self.code_bytes)
+        if codes.shape != expected:
+            raise RuntimeError(f"encode_batch returned {codes.shape}, expected {expected}")
         return codes
 
     def distances(self, query: np.ndarray, codes: np.ndarray) -> np.ndarray:

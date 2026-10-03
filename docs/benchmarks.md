@@ -19,9 +19,13 @@ To compare TurboQuant and RaBitQ on one machine, run
 table under `python/benchmarks/results/` (gitignored). The draw is float32
 N(0, 1), shared by every row. Accuracy is recall of the asymmetric distance
 against exact squared L2, plus the mean relative error of that distance.
-Throughput uses `encode_batch` and `distance_1_to_n` for TurboQuant.
-RaBitQ search is also `distance_1_to_n` (one query preparation, then a
-C++ scan of the slots). RaBitQ encode is still one `encode` call per vector.
+Throughput uses `encode_batch` and `distance_1_to_n` for both
+quantizers. TurboQuant's batch is an OpenMP loop (`num_threads=1` in
+this comparison). RaBitQ's batch is one serial C++ pass: its encode
+throws on a zero residual, so that pass does not enter an OpenMP worker.
+RaBitQ 4-bit and 8-bit codes still follow Extended RaBitQ Algorithm 1.
+The critical values are ordered by `(threshold, coordinate)`: a radix
+sort when there are at least 4096 of them, and `std::sort` below that.
 `--quick` is a smoke preset; the default grid is dims 128 and 1024,
 TurboQuant at 4 and 8 bits, RaBitQ at 1, 4, and 8 bits.
 

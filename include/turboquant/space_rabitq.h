@@ -116,6 +116,35 @@ inline float dot4From(const float *q, const uint8_t *packed, size_t begin,
     return acc;
 }
 
+// IEEE-754 order, so a larger finite float gets a larger uint32.
+inline uint32_t sortableFloat(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t mask = (bits & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u;
+    return bits ^ mask;
+}
+
+// Stable 8-bit LSD radix. Used for (threshold, coordinate) keys.
+inline void radixSortU64(std::vector<uint64_t> &keys) {
+    if (keys.size() < 2)
+        return;
+    std::vector<uint64_t> scratch(keys.size());
+    for (int shift = 0; shift < 64; shift += 8) {
+        size_t count[256] = {};
+        for (uint64_t key : keys)
+            ++count[(key >> shift) & 255u];
+        size_t sum = 0;
+        for (size_t &bin : count) {
+            const size_t n = bin;
+            bin = sum;
+            sum += n;
+        }
+        for (uint64_t key : keys)
+            scratch[count[(key >> shift) & 255u]++] = key;
+        keys.swap(scratch);
+    }
+}
+
 inline float dot8From(const float *q, const uint8_t *packed, size_t begin,
                       size_t n) {
     float acc = 0.0f;
@@ -403,6 +432,18 @@ public:
         packCodes(codes.data(), norm, dot, bytes);
     }
 
+    // Row-major [n, dim] into n packed slots. One C++ pass, same encode as
+    // the single-vector call. Serial on purpose: encode throws, and that
+    // exception must not leave an OpenMP worker.
+    void encodeBatch(const float *raws, size_t n, void *out) const {
+        if (out == nullptr || (n > 0 && raws == nullptr))
+            throw std::invalid_argument("RaBitQ encodeBatch: null pointer");
+        auto *bytes = static_cast<uint8_t *>(out);
+        const size_t stride = codeSizeBytes();
+        for (size_t i = 0; i < n; ++i)
+            encode(raws + i * dim_, bytes + i * stride);
+    }
+
     // `out` must hold querySizeBytes(). q has length dim().
     void prepareQuery(const float *q, void *out) const {
         if (q == nullptr || out == nullptr)
@@ -548,7 +589,7 @@ private:
         return acc;
     }
 
-        // Extended RaBitQ Algorithm 1. `rotated_unit` is o'. Writes one unsigned
+    // Extended RaBitQ Algorithm 1. `rotated_unit` is o'. Writes one unsigned
     // grid index per coordinate and returns <y, o'> in float32.
     //
     // Grid coordinates are the half-integers
@@ -576,36 +617,42 @@ private:
         }
         const std::vector<int> initial = code;
 
-        struct Event {
-            float t;
-            uint32_t index;
-        };
-        std::vector<Event> events;
-        events.reserve(padded_ * static_cast<size_t>(start_pos));
+        // One key per critical value: high 32 bits are the sortable
+        // threshold, low 32 bits are the coordinate. Radix order matches
+        // sorting by (t, index). Below a few thousand keys a comparison
+        // sort is faster, so that path stays.
+        const size_t steps_per_coord =
+            static_cast<size_t>(std::max(start_pos - 1, 0));
+        std::vector<uint64_t> keys;
+        keys.reserve(padded_ * steps_per_coord);
         for (size_t i = 0; i < padded_; ++i) {
             const float oi = rotated_unit[i];
             if (oi > 0.0f) {
                 for (int k = start_pos + 1; k <= levels - 1; ++k) {
                     const float t =
                         (static_cast<float>(k) - 0.5f - center_) / oi;
-                    events.push_back(Event{t, static_cast<uint32_t>(i)});
+                    const uint64_t key =
+                        (static_cast<uint64_t>(rabitq_detail::sortableFloat(t))
+                         << 32) |
+                        static_cast<uint32_t>(i);
+                    keys.push_back(key);
                 }
             } else if (oi < 0.0f) {
                 for (int m = start_neg - 1; m >= 0; --m) {
                     const float t =
                         (static_cast<float>(m) + 0.5f - center_) / oi;
-                    events.push_back(Event{t, static_cast<uint32_t>(i)});
+                    const uint64_t key =
+                        (static_cast<uint64_t>(rabitq_detail::sortableFloat(t))
+                         << 32) |
+                        static_cast<uint32_t>(i);
+                    keys.push_back(key);
                 }
             }
         }
-        std::sort(events.begin(), events.end(),
-                  [](const Event &a, const Event &b) {
-                      if (a.t < b.t)
-                          return true;
-                      if (b.t < a.t)
-                          return false;
-                      return a.index < b.index;
-                  });
+        if (keys.size() >= 4096)
+            rabitq_detail::radixSortU64(keys);
+        else
+            std::sort(keys.begin(), keys.end());
 
         // Squared cosine is monotone with the cosine for a positive dot,
         // and it avoids a sqrt in the comparison.
@@ -619,8 +666,8 @@ private:
             best_score = consider(dot, normsq);
             have = true;
         }
-        for (size_t s = 0; s < events.size(); ++s) {
-            const size_t i = events[s].index;
+        for (size_t s = 0; s < keys.size(); ++s) {
+            const size_t i = static_cast<size_t>(keys[s] & 0xFFFFFFFFu);
             const int delta = (rotated_unit[i] > 0.0f) ? 1 : -1;
             const int neu = code[i] + delta;
             if (neu < 0 || neu >= levels) {
@@ -651,7 +698,8 @@ private:
         if (best_step >= 0) {
             code = initial;
             for (long long s = 0; s <= best_step; ++s) {
-                const size_t i = events[static_cast<size_t>(s)].index;
+                const size_t i =
+                    static_cast<size_t>(keys[static_cast<size_t>(s)] & 0xFFFFFFFFu);
                 const int delta = (rotated_unit[i] > 0.0f) ? 1 : -1;
                 code[i] += delta;
             }

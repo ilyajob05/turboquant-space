@@ -359,6 +359,18 @@ PYBIND11_MODULE(_turboquant, m) {
                  return code;
              },
              py::arg("x"))
+        .def("encode_batch",
+             [](const RaBitQSpace &self, py::buffer input) {
+                 ssize_t rows = 0;
+                 const float *data = as_float_ptr(input, self.dim(), "input", 2, &rows);
+                 const size_t n = static_cast<size_t>(rows);
+                 auto codes = py::array_t<uint8_t>(
+                     {static_cast<ssize_t>(n),
+                      static_cast<ssize_t>(self.codeSizeBytes())});
+                 self.encodeBatch(data, n, codes.mutable_data());
+                 return codes;
+             },
+             py::arg("X"))
         .def("distance",
              [](const RaBitQSpace &self, py::buffer query, py::buffer code) {
                  const float *q = as_float_ptr(query, self.dim(), "query", 1);

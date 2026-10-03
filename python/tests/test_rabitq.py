@@ -196,6 +196,22 @@ def test_distance_m_to_n_matches_rows(bits):
         np.testing.assert_allclose(matrix[i], row, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("bits", [1, 4, 8])
+@pytest.mark.parametrize("dim", [6, 32])
+def test_encode_batch_matches_single(bits, dim):
+    """encode_batch writes the same slots as encode, one row at a time."""
+    rng = np.random.default_rng(9000 + bits * 100 + dim)
+    centroid = rng.standard_normal(dim).astype(np.float32) * np.float32(0.1)
+    space = RaBitQSpace(dim, rot_seed=11, centroid=centroid, bits=bits)
+    n = 5
+    base = rng.standard_normal((n, dim)).astype(np.float32)
+    batch = np.asarray(space.encode_batch(base), dtype=np.uint8)
+    assert batch.shape == (n, space.code_size_bytes())
+    for i in range(n):
+        single = np.asarray(space.encode(base[i]), dtype=np.uint8)
+        np.testing.assert_array_equal(batch[i], single)
+
+
 def test_distance_batch_rejects_bad_code_bytes():
     space = RaBitQSpace(16, rot_seed=1, bits=4)
     query = np.ones(16, np.float32)
