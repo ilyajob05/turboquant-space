@@ -2,21 +2,20 @@
 
 // RaBitQ (Gao & Long, SIGMOD 2024) and Extended RaBitQ
 // (Gao, Gou, Xu, Yang, Liu, Long; arXiv:2409.09913). Header-only.
-// Rotation is srht.h, included beside this file. A copy into HNSWLIB
-// takes both headers and keeps them in the same directory.
-// Asymmetric squared L2. Not a code-to-code score, so it must not be used
-// as the HNSW link-construction metric.
+// Asymmetric squared L2 (prepared query x code). Not a code-to-code score,
+// so it must not be used as the HNSW link-construction metric.
 //
-// bits is 1, 4, or 8. D = padded_dim = roundUpPow2(max(input_dim, 4)).
-// Coordinates [input_dim, D) are 0 before the rotation. The rotation is an
-// SRHT (srht.h): splitmix64 signs, then a Walsh-Hadamard scaled by 1/sqrt(D).
+// bits is 1, 4, or 8. Coordinates [dim, D) are 0 before the rotation.
+// Rotation (rotation.h):
+//   BlockKac (default)  D = dim rounded up to a multiple of 64, 3 rounds of
+//                       signs + overlapping Walsh–Hadamard blocks + Kac step
+//   LegacySrht          D = roundUpPow2(max(dim, 4)), one SRHT round —
+//                       reproduces codes written by turboquant-space 0.1.x
 //
 // Slot, little-endian. The two float32 tails are copied with memcpy because
 // the payload length is not always a multiple of 4.
 //   bits 1: uint8 signs[(D + 7) / 8]
 //           bit i set => coordinate +1/sqrt(D), else -1/sqrt(D)
-//           This layout, including dot_factor's scale, is the original
-//           1-bit code. Do not retarget it at the ±1/2 grid below.
 //   bits 4: uint8 nibbles[D / 2]
 //           low nibble = even index, high nibble = odd index, value 0..15
 //   bits 8: uint8 codes[D], value 0..255
@@ -26,394 +25,90 @@
 //           4/8-bit: y_i = code_i - (2^bits - 1) / 2
 //                    (the centered grid of eq. 7; ||y|| cancels in the ratio
 //                    and is not stored)
+//   x == c is encoded as norm 0, dot_factor 1: its distance is exactly ||q - c||^2.
 //
-// Prepared query, (D + 2) float32:
-//   rotated unit residual o' or q' [D], ||q - c||, sum of the rotated units.
-//   1-bit distance reads only the norm. 4/8-bit distance uses the sum so the
-//   inner product is <code, q'> - center * sum(q'), which is eq. 12.
+// Prepared query (querySizeBytes()):
+//   float query (4/8-bit, or 1-bit with query_bits = 0), (D + 2) float32:
+//     rotated unit residual q' [D], ||q - c||, sum of q'.
+//     4/8-bit inner product is <code, q'> - center * sum(q'), which is eq. 12.
+//   quantized query (1-bit, query_bits = B_q > 0, the paper's default B_q = 4):
+//     bitwise.h header (4 float32) + B_q bit-planes of D/64 uint64;
+//     the distance is (B_q + 1) * D/64 popcounts per code.
 //
-// get_dist_func() is one kernel, chosen in the constructor from `bits` and
-// the ISA of this translation unit: AVX2, else NEON, else scalar. Every
-// kernel returns the same squared L2. Only the inner-product sum differs.
-// distancePreparedScalar keeps the scalar sum callable for tests.
-// 4-bit SIMD splits nibbles the same way as TurboQuant (low = even index)
-// and widens the RaBitQ index. It does not use Lloyd-Max centroids or the
-// QJL sign bit.
+// Kernels are chosen once in the constructor: AVX2 by CPUID (runtime
+// dispatch; the TU may be compiled for baseline x86-64), NEON on aarch64,
+// scalar otherwise. Distance kernels never throw and return values >= 0.
+//
+// Error bound (RaBitQ Theorem 3.2): with probability >= 1 - delta,
+//   |<o,q'> - est| <= eps0 * sqrt((1 - <o_bar,o'>^2) / <o_bar,o'>^2) / sqrt(D - 1)
+// distanceBound() turns it into [lower, upper] for the squared distance
+// (eps0 = 1.9 by default; quantized-query error is not included).
 //
 // 4/8-bit encode_mode. The constructor default is -1, resolved from bits:
 // 1-bit stays algorithm1; 4-bit and 8-bit use fixed_scale.
 //   0 algorithm1      sort every threshold. Bit-exact Extended RaBitQ
-//                     Algorithm 1. Pass 0 to keep that code at 4 or 8 bits.
+//                     Algorithm 1.
 //   1 fixed_scale     one scale t frozen for the whole space, then O(1)
 //                     per coordinate. t is the mean Algorithm 1 plateau
 //                     edge over 100 N(0,1) residuals at seed 42 (not
-//                     rot_seed). This is the 4/8-bit default. At 8 bits
-//                     and dim 128 that single t does not concentrate, so
-//                     recall@10 can drop by more than 0.01 versus the sweep.
+//                     rot_seed). This is the 4/8-bit default.
 //   2 windowed_scale  one scale per vector, inside the RaBitQ-Library
 //                     tight interval, chosen by a min-heap of the next
-//                     magnitude event. This is not the library interval
-//                     pruner. No inner thread pool: encode uses only
-//                     automatic storage, so one space may be called from
-//                     several outer threads.
-// fixed_scale and windowed_scale require bits 4 or 8. Passing either with
-// bits 1 throws. t for fixed_scale is a positive finite double, stored
-// once; the other modes leave it at 0.
+//                     magnitude event.
+// fixed_scale and windowed_scale require bits 4 or 8.
 
 #include <algorithm>
-#include <cassert>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "srht.h"
+#include "../common/config.h"
+#include "bitwise.h"
+#include "kernels.h"
+#include "../common/rotation.h"
+#include "../common/srht.h"
 
-#if defined(__aarch64__) || defined(__ARM_NEON)
-#  define TURBOQUANT_RABITQ_NEON 1
-#  include <arm_neon.h>
-#endif
+// Namespaces follow include/ directories: RaBitQ lives in rabitq::, shared
+// code is always called with an explicit common:: qualifier.
+namespace vsq::rabitq {
 
-#if defined(__AVX2__)
-#  define TURBOQUANT_RABITQ_AVX2 1
-#  include <immintrin.h>
-#endif
-
-// RaBitQ is not nested in turboquant. A nested scope would also see
-// SRHT names, and TurboQuant names in a translation unit that includes
-// both spaces. Shared rotation is called as turboquant::.
-// turboquant::RaBitQSpace is an alias of rabitq::RaBitQSpace.
-namespace rabitq {
-namespace detail {
-
-// Which inner-product kernel a distance function instantiates.
-// The constructor picks one ISA for the whole translation unit.
-enum class DotIsa { Scalar, Neon, Avx2 };
-
-// Bit i set => coordinate contributes +q_i. Bit clear => -q_i.
-// Row b, lane k is 0 when bit k of b is set, else the float sign bit,
-// so XOR with the query flips the sign only for a clear bit.
-// Each row is 32 bytes and 32-byte aligned for an AVX2 aligned load.
-inline const uint32_t *signXorMask(unsigned bits) {
-#if defined(TURBOQUANT_RABITQ_NEON) || defined(TURBOQUANT_RABITQ_AVX2)
-    struct Table {
-        alignas(32) uint32_t row[256][8];
-        Table() {
-            for (int b = 0; b < 256; ++b) {
-                for (int k = 0; k < 8; ++k)
-                    row[b][k] = (b & (1 << k)) ? 0u : 0x80000000u;
-            }
-        }
-    };
-    static const Table table;
-    return table.row[bits & 255u];
-#else
-    (void)bits;
-    return nullptr;
-#endif
-}
-
-inline float dot1From(const float *q, const uint8_t *signs, size_t begin,
-                      size_t n, float inv_sqrt_d) {
-    float acc = 0.0f;
-    for (size_t i = begin; i < n; ++i) {
-        const unsigned bit = (signs[i >> 3] >> (i & 7u)) & 1u;
-        const float s = bit ? inv_sqrt_d : -inv_sqrt_d;
-        acc += s * q[i];
-    }
-    return acc;
-}
-
-inline float dot4From(const float *q, const uint8_t *packed, size_t begin,
-                      size_t n) {
-    float acc = 0.0f;
-    for (size_t i = begin; i < n; ++i) {
-        const uint8_t byte = packed[i >> 1];
-        const uint8_t nib = (i & 1u) ? static_cast<uint8_t>(byte >> 4)
-                                     : static_cast<uint8_t>(byte & 0x0Fu);
-        acc += static_cast<float>(nib) * q[i];
-    }
-    return acc;
-}
-
-// IEEE-754 order, so a larger finite float gets a larger uint32.
-inline uint32_t sortableFloat(float value) {
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    const uint32_t mask = (bits & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u;
-    return bits ^ mask;
-}
-
-// Magnitude on the extended grid. ex_bits = bits - 1, so max_code is
-// 7 at 4 bits and 127 at 8 bits. q = code + 0.5 matches |grid - center|
-// at centers 7.5 and 127.5. Thresholds are the integers k / magnitude,
-// the same events Algorithm 1 sorts. magnitude >= 0, t >= 0, max_code >= 0.
-inline int magnitudeAtScale(double magnitude, double t, int max_code) {
-    if (!(magnitude > 0.0) || !(t > 0.0) || max_code <= 0)
-        return 0;
-    int code = static_cast<int>(
-        std::min(t * magnitude, static_cast<double>(max_code)));
-    if (code < 0)
-        code = 0;
-    if (code < max_code &&
-        (static_cast<double>(code) + 1.0) / magnitude <= t)
-        ++code;
-    else if (code > 0 && static_cast<double>(code) / magnitude > t)
-        --code;
-    if (code < 0 || code > max_code)
-        throw std::logic_error("RaBitQ magnitudeAtScale left the grid");
-    return code;
-}
-
-// Fraction of [0, t_end] skipped before the per-vector search.
-// Index is ex_bits. 3 -> 4-bit codes (0.52), 7 -> 8-bit codes (0.77).
-// Values are the RaBitQ-Library table kTightStart.
-inline float tightStart(int ex_bits) {
-    static constexpr float kStart[9] = {
-        0.00f, 0.15f, 0.20f, 0.52f, 0.59f, 0.71f, 0.75f, 0.77f, 0.81f};
-    if (ex_bits < 0 || ex_bits >= 9)
-        throw std::invalid_argument("RaBitQ: ex_bits out of the tight-start table");
-    return kStart[ex_bits];
-}
-
-// Stable 8-bit LSD radix. Used for (threshold, coordinate) keys.
-inline void radixSortU64(std::vector<uint64_t> &keys) {
-    if (keys.size() < 2)
-        return;
-    std::vector<uint64_t> scratch(keys.size());
-    for (int shift = 0; shift < 64; shift += 8) {
-        size_t count[256] = {};
-        for (uint64_t key : keys)
-            ++count[(key >> shift) & 255u];
-        size_t sum = 0;
-        for (size_t &bin : count) {
-            const size_t n = bin;
-            bin = sum;
-            sum += n;
-        }
-        for (uint64_t key : keys)
-            scratch[count[(key >> shift) & 255u]++] = key;
-        keys.swap(scratch);
-    }
-}
-
-inline float dot8From(const float *q, const uint8_t *packed, size_t begin,
-                      size_t n) {
-    float acc = 0.0f;
-    for (size_t i = begin; i < n; ++i)
-        acc += static_cast<float>(packed[i]) * q[i];
-    return acc;
-}
-
-// q has length n. signs/packed is the slot payload. n is padded_dim.
-template <DotIsa Isa>
-float dot1(const float *q, const uint8_t *signs, size_t n, float inv_sqrt_d);
-
-template <DotIsa Isa>
-float dot4(const float *q, const uint8_t *packed, size_t n);
-
-template <DotIsa Isa>
-float dot8(const float *q, const uint8_t *packed, size_t n);
-
-template <>
-inline float dot1<DotIsa::Scalar>(const float *q, const uint8_t *signs,
-                                  size_t n, float inv_sqrt_d) {
-    return dot1From(q, signs, 0, n, inv_sqrt_d);
-}
-
-template <>
-inline float dot4<DotIsa::Scalar>(const float *q, const uint8_t *packed,
-                                  size_t n) {
-    return dot4From(q, packed, 0, n);
-}
-
-template <>
-inline float dot8<DotIsa::Scalar>(const float *q, const uint8_t *packed,
-                                  size_t n) {
-    return dot8From(q, packed, 0, n);
-}
-
-#if defined(TURBOQUANT_RABITQ_NEON)
-template <>
-inline float dot1<DotIsa::Neon>(const float *q, const uint8_t *signs,
-                                size_t n, float inv_sqrt_d) {
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
-    const float32x4_t scale = vdupq_n_f32(inv_sqrt_d);
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        const uint32_t *mask = signXorMask(signs[i >> 3]);
-        float32x4_t q0 = vld1q_f32(q + i);
-        float32x4_t q1 = vld1q_f32(q + i + 4);
-        q0 = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(q0),
-                                             vld1q_u32(mask)));
-        q1 = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(q1),
-                                             vld1q_u32(mask + 4)));
-        acc0 = vaddq_f32(acc0, vmulq_f32(q0, scale));
-        acc1 = vaddq_f32(acc1, vmulq_f32(q1, scale));
-    }
-    return vaddvq_f32(vaddq_f32(acc0, acc1)) +
-           dot1From(q, signs, i, n, inv_sqrt_d);
-}
-
-// 16 coordinates per iteration: 8 packed bytes, low nibble = even index.
-template <>
-inline float dot4<DotIsa::Neon>(const float *q, const uint8_t *packed,
-                                size_t n) {
-    const uint8x8_t mask = vdup_n_u8(0x0F);
-    float32x4_t s0 = vdupq_n_f32(0.0f);
-    float32x4_t s1 = vdupq_n_f32(0.0f);
-    float32x4_t s2 = vdupq_n_f32(0.0f);
-    float32x4_t s3 = vdupq_n_f32(0.0f);
-    size_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        const uint8x8_t bytes = vld1_u8(packed + (i >> 1));
-        const uint8x8_t lo = vand_u8(bytes, mask);
-        const uint8x8_t hi = vshr_n_u8(bytes, 4);
-        const uint8x8x2_t z = vzip_u8(lo, hi);
-        const uint16x8_t w0 = vmovl_u8(z.val[0]);
-        const uint16x8_t w1 = vmovl_u8(z.val[1]);
-        const float32x4_t f0 =
-            vcvtq_f32_u32(vmovl_u16(vget_low_u16(w0)));
-        const float32x4_t f1 =
-            vcvtq_f32_u32(vmovl_u16(vget_high_u16(w0)));
-        const float32x4_t f2 =
-            vcvtq_f32_u32(vmovl_u16(vget_low_u16(w1)));
-        const float32x4_t f3 =
-            vcvtq_f32_u32(vmovl_u16(vget_high_u16(w1)));
-        s0 = vmlaq_f32(s0, vld1q_f32(q + i), f0);
-        s1 = vmlaq_f32(s1, vld1q_f32(q + i + 4), f1);
-        s2 = vmlaq_f32(s2, vld1q_f32(q + i + 8), f2);
-        s3 = vmlaq_f32(s3, vld1q_f32(q + i + 12), f3);
-    }
-    const float acc =
-        vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
-    return acc + dot4From(q, packed, i, n);
-}
-
-template <>
-inline float dot8<DotIsa::Neon>(const float *q, const uint8_t *packed,
-                                size_t n) {
-    float32x4_t s0 = vdupq_n_f32(0.0f);
-    float32x4_t s1 = vdupq_n_f32(0.0f);
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        const uint8x8_t b = vld1_u8(packed + i);
-        const uint16x8_t w = vmovl_u8(b);
-        const float32x4_t f0 =
-            vcvtq_f32_u32(vmovl_u16(vget_low_u16(w)));
-        const float32x4_t f1 =
-            vcvtq_f32_u32(vmovl_u16(vget_high_u16(w)));
-        s0 = vmlaq_f32(s0, vld1q_f32(q + i), f0);
-        s1 = vmlaq_f32(s1, vld1q_f32(q + i + 4), f1);
-    }
-    return vaddvq_f32(vaddq_f32(s0, s1)) + dot8From(q, packed, i, n);
-}
-#endif
-
-#if defined(TURBOQUANT_RABITQ_AVX2)
-inline float hsum256(__m256 v) {
-    const __m128 lo = _mm256_castps256_ps128(v);
-    const __m128 hi = _mm256_extractf128_ps(v, 1);
-    const __m128 s4 = _mm_add_ps(lo, hi);
-    const __m128 dup = _mm_movehdup_ps(s4);
-    const __m128 sums = _mm_add_ps(s4, dup);
-    const __m128 high = _mm_movehl_ps(sums, sums);
-    return _mm_cvtss_f32(_mm_add_ss(sums, high));
-}
-
-template <>
-inline float dot1<DotIsa::Avx2>(const float *q, const uint8_t *signs,
-                                size_t n, float inv_sqrt_d) {
-    __m256 acc = _mm256_setzero_ps();
-    const __m256 scale = _mm256_set1_ps(inv_sqrt_d);
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        const __m256i mask = _mm256_load_si256(
-            reinterpret_cast<const __m256i *>(signXorMask(signs[i >> 3])));
-        __m256 qv = _mm256_loadu_ps(q + i);
-        qv = _mm256_xor_ps(qv, _mm256_castsi256_ps(mask));
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(qv, scale));
-    }
-    return hsum256(acc) + dot1From(q, signs, i, n, inv_sqrt_d);
-}
-
-// 16 coordinates per iteration. unpacklo(low nibble, high nibble) is the
-// same even/odd order as NEON vzip_u8.
-template <>
-inline float dot4<DotIsa::Avx2>(const float *q, const uint8_t *packed,
-                                size_t n) {
-    const __m128i nibble = _mm_set1_epi8(0x0F);
-    __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
-    size_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        const __m128i bytes =
-            _mm_loadl_epi64(reinterpret_cast<const __m128i *>(packed + (i >> 1)));
-        const __m128i lo = _mm_and_si128(bytes, nibble);
-        const __m128i hi =
-            _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble);
-        const __m128i codes = _mm_unpacklo_epi8(lo, hi);
-        const __m128i c0 = _mm_cvtepu8_epi32(codes);
-        const __m128i c1 = _mm_cvtepu8_epi32(_mm_srli_si128(codes, 4));
-        const __m128i c2 = _mm_cvtepu8_epi32(_mm_srli_si128(codes, 8));
-        const __m128i c3 = _mm_cvtepu8_epi32(_mm_srli_si128(codes, 12));
-        const __m256 f0 = _mm256_cvtepi32_ps(_mm256_set_m128i(c1, c0));
-        const __m256 f1 = _mm256_cvtepi32_ps(_mm256_set_m128i(c3, c2));
-        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(q + i), f0));
-        acc1 = _mm256_add_ps(acc1,
-                             _mm256_mul_ps(_mm256_loadu_ps(q + i + 8), f1));
-    }
-    return hsum256(_mm256_add_ps(acc0, acc1)) + dot4From(q, packed, i, n);
-}
-
-template <>
-inline float dot8<DotIsa::Avx2>(const float *q, const uint8_t *packed,
-                                size_t n) {
-    __m256 acc = _mm256_setzero_ps();
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        const __m128i bytes =
-            _mm_loadl_epi64(reinterpret_cast<const __m128i *>(packed + i));
-        const __m128i c0 = _mm_cvtepu8_epi32(bytes);
-        const __m128i c1 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes, 4));
-        const __m256 f = _mm256_cvtepi32_ps(_mm256_set_m128i(c1, c0));
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_loadu_ps(q + i), f));
-    }
-    return hsum256(acc) + dot8From(q, packed, i, n);
-}
-#endif
-
-}  // namespace detail
-
-// One space: fixed centroid, fixed rotation seed, fixed bit width, fixed D.
+// One space: fixed centroid, rotation, bit width and D.
 class RaBitQSpace {
 public:
-    // centroid == nullptr means the zero vector of length `dim`.
-    // The pointer is copied; it is not retained.
-    // bits is appended so existing (dim, seed, centroid) calls stay 1-bit.
+    using DistFunc = float (*)(const void *, const void *, const void *);
+    static constexpr float kDefaultEps0 = 1.9f;  // RaBitQ confidence constant
+
+    // centroid == nullptr means the zero vector of length `dim` (copied).
     // encode_mode -1/0/1/2: default, algorithm1, fixed_scale, windowed_scale.
-    // -1 resolves from bits: 1 -> algorithm1, 4 or 8 -> fixed_scale.
-    RaBitQSpace(size_t dim, uint64_t rot_seed, const float *centroid,
-                int bits = 1, int encode_mode = -1)
-        : dim_(dim),
-          padded_(turboquant::roundUpPow2AtLeast4(dim)),
+    // query_bits -1: default (1-bit: 4, the paper's B_q; 4/8-bit: 0 = float
+    // query). 1-bit accepts 0..8; 4/8-bit accept 0 only.
+    RaBitQSpace(size_t dim, uint64_t rot_seed, const float *centroid, int bits = 1,
+                int encode_mode = -1, common::RotationKind rotation = common::RotationKind::BlockKac,
+                int rotation_rounds = 3, int query_bits = -1, int num_threads = 0,
+                common::Isa isa = common::detectIsa())
+        : dim_(checkedDim(dim)),
           bits_(bits),
           rot_seed_(rot_seed),
+          rot_(dim, rot_seed, rotation_rounds, rotation, isa),
+          padded_(rot_.paddedDim()),
           centroid_(dim, 0.0f),
           inv_sqrt_d_(1.0f / std::sqrt(static_cast<float>(padded_))),
           center_(bits >= 8 ? 127.5f : (bits >= 4 ? 7.5f : 0.5f)),
           encode_mode_(encode_mode),
-          t_fixed_(0.0) {
-        if (dim_ == 0)
-            throw std::invalid_argument("RaBitQ: dim must be positive");
+          t_fixed_(0.0),
+          isa_(common::resolveIsa(isa)),
+          num_threads_(common::resolveNumThreads(num_threads)) {
         if (bits_ != 1 && bits_ != 4 && bits_ != 8)
             throw std::invalid_argument("RaBitQ: bits must be 1, 4, or 8");
         if (encode_mode_ < -1 || encode_mode_ > 2)
@@ -424,12 +119,11 @@ public:
         if (encode_mode_ != 0 && bits_ == 1)
             throw std::invalid_argument(
                 "RaBitQ: fixed_scale and windowed_scale require bits 4 or 8");
-        if (centroid != nullptr) {
-            for (size_t i = 0; i < dim_; ++i)
-                centroid_[i] = centroid[i];
-        }
-        signs_ = turboquant::generateSigns(padded_, rot_seed_);
-        dist_func_ = selectDist(bits_);
+        query_bits_ = resolveQueryBits(query_bits);
+        if (centroid != nullptr)
+            std::copy(centroid, centroid + dim_, centroid_.begin());
+        dist_func_ = selectDist();
+        bitwise_ = bitwise::selectBitwise(isa_);
         if (encode_mode_ == 1)
             t_fixed_ = calibrateFixedScale();
     }
@@ -438,6 +132,11 @@ public:
     size_t paddedDim() const { return padded_; }
     int bits() const { return bits_; }
     uint64_t rotSeed() const { return rot_seed_; }
+    int queryBits() const { return query_bits_; }
+    common::Isa kernelIsa() const { return isa_; }
+    int rotationRounds() const { return rot_.rounds(); }
+    common::RotationKind rotationKind() const { return rot_.kind(); }
+    const std::vector<float> &centroid() const { return centroid_; }
     // "algorithm1", "fixed_scale", or "windowed_scale".
     const char *encodeModeName() const {
         if (encode_mode_ == 1)
@@ -452,52 +151,46 @@ public:
     // Bytes of one data slot.
     size_t codeSizeBytes() const { return payloadBytes() + 2 * sizeof(float); }
 
-    // Bytes of one prepared query (rotated unit, norm, sum of rotated units).
-    size_t querySizeBytes() const { return (padded_ + 2) * sizeof(float); }
+    // Bytes of one prepared query.
+    size_t querySizeBytes() const {
+        return bitwiseQuery() ? bitwise::preparedBytes(padded_, query_bits_)
+                              : (padded_ + 2) * sizeof(float);
+    }
 
-    // HNSWLIB SpaceInterface shape. These three are non-virtual on purpose:
-    // the header does not include hnswlib. A copy placed next to space_l2.h
-    // can inherit SpaceInterface<float> and forward to them.
-    // get_dist_func() is the kernel selected for this bits/ISA pair.
+    // HNSWLIB SpaceInterface shape (non-virtual: the header does not include
+    // hnswlib; a copy next to space_l2.h can inherit and forward).
     size_t get_data_size() { return codeSizeBytes(); }
-
-    using DistFunc = float (*)(const void *, const void *, const void *);
-
     DistFunc get_dist_func() { return dist_func_; }
-
     void *get_dist_func_param() { return this; }
 
-    // Writes one slot. Throws std::invalid_argument if ||x - c|| == 0 or
-    // the estimator denominator is 0. The message includes D.
+    // Writes one slot. x has dim() floats. Throws only for null pointers or a
+    // non-finite input; x == c is a valid input (see the slot layout).
     void encode(const float *x, void *slot) const {
         if (x == nullptr || slot == nullptr)
             throw std::invalid_argument("RaBitQ encode: null pointer");
-        std::vector<float> rotated(padded_, 0.0f);
+        float *rotated = scratch();
         float norm = 0.0f;
         for (size_t i = 0; i < dim_; ++i) {
             const float v = x[i] - centroid_[i];
             rotated[i] = v;
             norm += v * v;
         }
+        std::memset(rotated + dim_, 0, (padded_ - dim_) * sizeof(float));
         norm = std::sqrt(norm);
+        if (!std::isfinite(norm))
+            throw std::invalid_argument("RaBitQ encode: input is not finite");
+        auto *bytes = static_cast<uint8_t *>(slot);
         if (!(norm > 0.0f)) {
-            throw std::invalid_argument(
-                "RaBitQ encode: ||x - c|| is 0, padded_dim=" +
-                std::to_string(padded_));
+            writeCenterSlot(bytes);
+            return;
         }
         const float inv = 1.0f / norm;
         for (size_t i = 0; i < dim_; ++i)
             rotated[i] *= inv;
-        rotateUnit(rotated.data());
+        rotateUnit(rotated);
 
-        auto *bytes = static_cast<uint8_t *>(slot);
         if (bits_ == 1) {
-            const float dot = dotWithCube(rotated.data());
-            if (!(dot > 0.0f) && !(dot < 0.0f)) {
-                throw std::invalid_argument(
-                    "RaBitQ encode: dot_factor is 0, padded_dim=" +
-                    std::to_string(padded_));
-            }
+            const float dot = dotWithCube(rotated);
             std::memset(bytes, 0, payloadBytes());
             for (size_t i = 0; i < padded_; ++i) {
                 if (rotated[i] >= 0.0f)
@@ -510,57 +203,95 @@ public:
             return;
         }
 
-        std::vector<uint8_t> codes(padded_);
+        static thread_local std::vector<uint8_t> codes;
+        if (codes.size() < padded_) codes.resize(padded_);
         float dot = 0.0f;
         if (encode_mode_ == 1)
-            dot = quantizeFixedScale(rotated.data(), codes.data());
+            dot = quantizeFixedScale(rotated, codes.data());
         else if (encode_mode_ == 2)
-            dot = quantizeWindowedScale(rotated.data(), codes.data());
+            dot = quantizeWindowedScale(rotated, codes.data());
         else
-            dot = quantizeExtended(rotated.data(), codes.data());
+            dot = quantizeExtended(rotated, codes.data());
         packCodes(codes.data(), norm, dot, bytes);
     }
 
-    // Row-major [n, dim] into n packed slots. One serial pass, same encode
-    // as the single-vector call. No inner thread pool: the caller is already
-    // threaded, and a throw stays on this thread.
+    // Row-major [n, dim] into n packed slots, OpenMP-parallel above 64 rows.
+    // The first exception thrown by any row is rethrown after the loop.
     void encodeBatch(const float *raws, size_t n, void *out) const {
         if (out == nullptr || (n > 0 && raws == nullptr))
             throw std::invalid_argument("RaBitQ encodeBatch: null pointer");
         auto *bytes = static_cast<uint8_t *>(out);
         const size_t stride = codeSizeBytes();
-        for (size_t i = 0; i < n; ++i)
-            encode(raws + i * dim_, bytes + i * stride);
+        std::exception_ptr error;
+        std::mutex error_mutex;
+        VSQ_OMP_PARALLEL_FOR(num_threads_, n)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+            const size_t i = static_cast<size_t>(ii);
+            try {
+                encode(raws + i * dim_, bytes + i * stride);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!error) error = std::current_exception();
+            }
+        }
+        if (error) std::rethrow_exception(error);
     }
 
     // `out` must hold querySizeBytes(). q has length dim().
     void prepareQuery(const float *q, void *out) const {
         if (q == nullptr || out == nullptr)
             throw std::invalid_argument("RaBitQ prepareQuery: null pointer");
-        std::vector<float> rotated(padded_, 0.0f);
+        float *rotated = scratch();
         float norm = 0.0f;
         for (size_t i = 0; i < dim_; ++i) {
             const float v = q[i] - centroid_[i];
             rotated[i] = v;
             norm += v * v;
         }
+        std::memset(rotated + dim_, 0, (padded_ - dim_) * sizeof(float));
         norm = std::sqrt(norm);
         if (norm > 0.0f) {
             const float inv = 1.0f / norm;
             for (size_t i = 0; i < dim_; ++i)
                 rotated[i] *= inv;
-            rotateUnit(rotated.data());
+            rotateUnit(rotated);
+        } else {
+            std::memset(rotated, 0, padded_ * sizeof(float));
+        }
+        if (bitwiseQuery()) {
+            bitwise::quantizeQueryBitplanes(rotated, padded_, query_bits_,
+                                                               norm, kQuerySeed, out);
+            return;
         }
         float sum_q = 0.0f;
         for (size_t i = 0; i < padded_; ++i)
             sum_q += rotated[i];
         auto *dst = static_cast<float *>(out);
-        std::memcpy(dst, rotated.data(), padded_ * sizeof(float));
+        std::memcpy(dst, rotated, padded_ * sizeof(float));
         std::memcpy(dst + padded_, &norm, sizeof(float));
         std::memcpy(dst + padded_ + 1, &sum_q, sizeof(float));
     }
 
-    // First pointer: prepared query. Second: code slot. Third: this space.
+    // Rotated unit residual R (x - c) / ||x - c|| into out (paddedDim()
+    // floats) and ||x - c|| into *norm; zeros when x == c. x has dim() floats.
+    void rotateResidual(const float *x, float *out, float *norm) const {
+        float nsq = 0.0f;
+        for (size_t i = 0; i < dim_; ++i) {
+            out[i] = x[i] - centroid_[i];
+            nsq += out[i] * out[i];
+        }
+        std::memset(out + dim_, 0, (padded_ - dim_) * sizeof(float));
+        *norm = std::sqrt(nsq);
+        if (!(*norm > 0.0f)) {
+            std::memset(out, 0, padded_ * sizeof(float));
+            return;
+        }
+        const float inv = 1.0f / *norm;
+        for (size_t i = 0; i < dim_; ++i) out[i] *= inv;
+        rotateUnit(out);
+    }
+
+    // First pointer: prepared query. Second: code slot.
     float distancePrepared(const void *prepared, const void *slot) const {
         return dist_func_(prepared, slot, this);
     }
@@ -568,49 +299,69 @@ public:
     // Raw query of length dim(). Uses get_dist_func(), so the HNSW pointer
     // and this path cannot drift.
     float distanceRaw(const float *q, const void *slot) const {
-        std::vector<float> prepared(querySizeBytes() / sizeof(float), 0.0f);
-        prepareQuery(q, prepared.data());
-        return get_dist_func_const()(prepared.data(), slot, this);
+        uint8_t *prepared = queryScratch();
+        prepareQuery(q, prepared);
+        return dist_func_(prepared, slot, this);
     }
 
-    // Same epilogue as get_dist_func(), accumulated in scalar order.
+    // Same estimate with the scalar kernel (tests compare every ISA to it).
     float distancePreparedScalar(const void *prepared, const void *slot) const {
+        if (bitwiseQuery())
+            return distBitwiseWith(prepared, slot, &bitwise::bitwiseScalar);
         if (bits_ == 1)
-            return distKernel<1, detail::DotIsa::Scalar>(prepared, slot,
-                                                               this);
+            return distKernel<1, detail::DotIsa::Scalar>(prepared, slot, this);
         if (bits_ == 4)
-            return distKernel<4, detail::DotIsa::Scalar>(prepared, slot,
-                                                               this);
+            return distKernel<4, detail::DotIsa::Scalar>(prepared, slot, this);
         return distKernel<8, detail::DotIsa::Scalar>(prepared, slot, this);
     }
 
     float distanceRawScalar(const float *q, const void *slot) const {
-        std::vector<float> prepared(querySizeBytes() / sizeof(float), 0.0f);
-        prepareQuery(q, prepared.data());
-        return distancePreparedScalar(prepared.data(), slot);
+        uint8_t *prepared = queryScratch();
+        prepareQuery(q, prepared);
+        return distancePreparedScalar(prepared, slot);
     }
 
-    // 1-to-N asymmetric search. `query` has length dim(). `codes` is n slots
-    // packed back to back, each codeSizeBytes() long. `out` has length n.
-    // The query is rotated once; each slot then uses the selected kernel.
+    // Estimate plus the RaBitQ confidence interval for the squared distance:
+    // *lower <= d_true <= *upper with probability >= 1 - delta (eps0).
+    float distanceBound(const void *prepared, const void *slot, float *lower, float *upper,
+                        float eps0 = kDefaultEps0) const {
+        const float d = dist_func_(prepared, slot, this);
+        const auto *bytes = static_cast<const uint8_t *>(slot);
+        const float xnorm = common::loadUnaligned<float>(bytes + payloadBytes());
+        const float df = normalizedDotFactor(bytes);
+        const float qnorm = bitwiseQuery()
+                                ? common::loadUnaligned<float>(prepared)
+                                : common::loadUnaligned<float>(
+                                      static_cast<const float *>(prepared) + padded_);
+        const float ratio = df > 0.0f ? std::sqrt(std::max(0.0f, 1.0f - df * df)) / df
+                                      : std::numeric_limits<float>::infinity();
+        const float eps = eps0 * ratio / std::sqrt(static_cast<float>(padded_ - 1));
+        const float half = 2.0f * xnorm * qnorm * eps;
+        if (lower) *lower = std::max(0.0f, d - half);
+        if (upper) *upper = d + half;
+        return d;
+    }
+
+    // 1-to-N asymmetric search. `codes` is n slots back to back.
     void distanceBatch1ToN(const float *query, const void *codes, size_t n,
                            float *out) const {
         if (query == nullptr || out == nullptr)
             throw std::invalid_argument("RaBitQ distanceBatch1ToN: null pointer");
         if (n > 0 && codes == nullptr)
             throw std::invalid_argument("RaBitQ distanceBatch1ToN: null codes");
-        std::vector<float> prepared(querySizeBytes() / sizeof(float));
+        std::vector<uint8_t> prepared(querySizeBytes());
         prepareQuery(query, prepared.data());
-        const auto *base = static_cast<const char *>(codes);
+        const auto *base = static_cast<const uint8_t *>(codes);
         const size_t stride = codeSizeBytes();
         const DistFunc fn = dist_func_;
-        for (size_t i = 0; i < n; ++i)
-            out[i] = fn(prepared.data(), base + i * stride, this);
+        VSQ_OMP_PARALLEL_FOR(num_threads_, n)
+        for (long long i = 0; i < static_cast<long long>(n); ++i)
+            out[i] = fn(prepared.data(), base + static_cast<size_t>(i) * stride, this);
     }
 
-    // M-to-N asymmetric search. `queries` is row-major [m, dim()].
-    // `codes` is n packed slots. `out` is row-major [m, n].
-    // Each query is rotated once, then dotted with every slot.
+    // M-to-N asymmetric search. `queries` is row-major [m, dim()], `out` is
+    // row-major [m, n]. Queries are prepared in blocks and each code tile is
+    // scored against the whole block (codes stay in cache).
     void distanceBatchMToN(const float *queries, size_t m, const void *codes,
                            size_t n, float *out) const {
         if (out == nullptr)
@@ -619,42 +370,76 @@ public:
             throw std::invalid_argument("RaBitQ distanceBatchMToN: null queries");
         if (n > 0 && codes == nullptr)
             throw std::invalid_argument("RaBitQ distanceBatchMToN: null codes");
-        std::vector<float> prepared(querySizeBytes() / sizeof(float));
-        const auto *base = static_cast<const char *>(codes);
+        const size_t qsz = querySizeBytes();
         const size_t stride = codeSizeBytes();
+        const auto *base = static_cast<const uint8_t *>(codes);
         const DistFunc fn = dist_func_;
-        for (size_t qi = 0; qi < m; ++qi) {
-            prepareQuery(queries + qi * dim_, prepared.data());
-            float *row = out + qi * n;
-            for (size_t i = 0; i < n; ++i)
-                row[i] = fn(prepared.data(), base + i * stride, this);
+        std::vector<uint8_t> block(std::min(m, kQueryBlock) * qsz);
+        for (size_t q0 = 0; q0 < m; q0 += kQueryBlock) {
+            const size_t qb = std::min(kQueryBlock, m - q0);
+            VSQ_OMP_PARALLEL_FOR_DYNAMIC(num_threads_, qb)
+            for (long long j = 0; j < static_cast<long long>(qb); ++j)
+                prepareQuery(queries + (q0 + static_cast<size_t>(j)) * dim_,
+                             block.data() + static_cast<size_t>(j) * qsz);
+            const size_t tiles = (n + kCodeTile - 1) / kCodeTile;
+            VSQ_OMP_PARALLEL_FOR_DYNAMIC(num_threads_, tiles)
+            for (long long t = 0; t < static_cast<long long>(tiles); ++t) {
+                const size_t c0 = static_cast<size_t>(t) * kCodeTile;
+                const size_t c1 = std::min(n, c0 + kCodeTile);
+                for (size_t c = c0; c < c1; ++c)
+                    for (size_t j = 0; j < qb; ++j)
+                        out[(q0 + j) * n + c] = fn(block.data() + j * qsz, base + c * stride, this);
+            }
         }
     }
 
-    // "1-neon", "4-avx2", "8-scalar", and the other bits/ISA pairs.
-    const char *distanceKernel() const {
-#if defined(TURBOQUANT_RABITQ_AVX2)
-        if (bits_ == 1)
-            return "1-avx2";
-        if (bits_ == 4)
-            return "4-avx2";
-        return "8-avx2";
-#elif defined(TURBOQUANT_RABITQ_NEON)
-        if (bits_ == 1)
-            return "1-neon";
-        if (bits_ == 4)
-            return "4-neon";
-        return "8-neon";
-#else
-        if (bits_ == 1)
-            return "1-scalar";
-        if (bits_ == 4)
-            return "4-scalar";
-        return "8-scalar";
-#endif
+    // "1-neon-q4", "4-avx2", "8-scalar", ...: bits, ISA, quantized query.
+    std::string distanceKernel() const {
+        std::string name = std::to_string(bits_) + "-" + common::isaName(isa_);
+        if (bitwiseQuery()) name += "-q" + std::to_string(query_bits_);
+        return name;
     }
 
 private:
+    static constexpr uint64_t kQuerySeed = 0x5241424954515ULL;  // dither seed
+    static constexpr size_t kQueryBlock = 64;
+    static constexpr size_t kCodeTile = 256;
+
+    static size_t checkedDim(size_t dim) {
+        if (dim == 0)
+            throw std::invalid_argument("RaBitQ: dim must be positive");
+        return dim;
+    }
+
+    int resolveQueryBits(int requested) const {
+        const bool bitplanes_ok = padded_ % 64 == 0;
+        if (requested < 0)
+            return (bits_ == 1 && bitplanes_ok) ? 4 : 0;
+        if (bits_ != 1 && requested != 0)
+            throw std::invalid_argument("RaBitQ: query_bits applies to 1-bit codes only");
+        if (requested > bitwise::kMaxQueryBits)
+            throw std::invalid_argument("RaBitQ: query_bits must be in [0, 8]");
+        if (requested > 0 && !bitplanes_ok)
+            throw std::invalid_argument(
+                "RaBitQ: a quantized query needs padded_dim % 64 == 0, padded_dim=" +
+                std::to_string(padded_));
+        return requested;
+    }
+
+    bool bitwiseQuery() const { return bits_ == 1 && query_bits_ > 0; }
+
+    // Per-thread D-float scratch; grows once, never per call.
+    float *scratch() const {
+        static thread_local std::vector<float> buf;
+        if (buf.size() < padded_) buf.resize(padded_);
+        return buf.data();
+    }
+    uint8_t *queryScratch() const {
+        static thread_local std::vector<uint8_t> buf;
+        if (buf.size() < querySizeBytes()) buf.resize(querySizeBytes());
+        return buf.data();
+    }
+
     size_t payloadBytes() const {
         if (bits_ == 1)
             return (padded_ + 7) / 8;
@@ -663,8 +448,28 @@ private:
         return padded_;
     }
 
-    void rotateUnit(float *unit) const {
-        turboquant::randomizedHadamard(unit, signs_.data(), padded_);
+    void rotateUnit(float *unit) const { rot_.applyPadded(unit); }
+
+    // x == c: norm 0 and a non-zero dot_factor, so the estimate is exact.
+    void writeCenterSlot(uint8_t *slot) const {
+        std::memset(slot, 0, payloadBytes());
+        const float zero = 0.0f, one = 1.0f;
+        std::memcpy(slot + payloadBytes(), &zero, sizeof(float));
+        std::memcpy(slot + payloadBytes() + sizeof(float), &one, sizeof(float));
+    }
+
+    // <o_bar, o'> with o_bar the unit-norm reconstruction (error bound input).
+    float normalizedDotFactor(const uint8_t *slot) const {
+        const float df = common::loadUnaligned<float>(slot + payloadBytes() + sizeof(float));
+        if (bits_ == 1)
+            return df;
+        double ysq = 0.0;
+        for (size_t i = 0; i < padded_; ++i) {
+            const unsigned code = bits_ == 4 ? ((slot[i >> 1] >> ((i & 1u) * 4u)) & 0x0Fu) : slot[i];
+            const double y = static_cast<double>(code) - static_cast<double>(center_);
+            ysq += y * y;
+        }
+        return ysq > 0.0 ? static_cast<float>(df / std::sqrt(ysq)) : 0.0f;
     }
 
     // <ō, o> where o is the rotated unit vector and ō_i = ±1/sqrt(D).
@@ -1052,88 +857,95 @@ private:
         std::memcpy(slot + n + sizeof(float), &dot, sizeof(float));
     }
 
+    // Float-query kernel. No validation: the slot and query are trusted
+    // (hnswlib calls this millions of times). Clamped to >= 0.
     template <int Bits, detail::DotIsa Isa>
     static float distKernel(const void *prepared, const void *slot,
                             const void *param) {
         const auto *self = static_cast<const RaBitQSpace *>(param);
-        if (prepared == nullptr || slot == nullptr)
-            throw std::invalid_argument("RaBitQ distance: null pointer");
-        assert(self->bits_ == Bits);
         const auto *qrot = static_cast<const float *>(prepared);
-        float qnorm = 0.0f;
-        std::memcpy(&qnorm, qrot + self->padded_, sizeof(float));
-
+        const float qnorm = common::loadUnaligned<float>(qrot + self->padded_);
         const auto *bytes = static_cast<const uint8_t *>(slot);
         const size_t payload = self->payloadBytes();
-        float xnorm = 0.0f;
-        float dot_factor = 0.0f;
-        std::memcpy(&xnorm, bytes + payload, sizeof(float));
-        std::memcpy(&dot_factor, bytes + payload + sizeof(float),
-                    sizeof(float));
-        if (!(dot_factor > 0.0f) && !(dot_factor < 0.0f)) {
-            throw std::invalid_argument(
-                "RaBitQ distance: dot_factor is 0, padded_dim=" +
-                std::to_string(self->padded_));
-        }
-
+        const float xnorm = common::loadUnaligned<float>(bytes + payload);
+        const float dot_factor = common::loadUnaligned<float>(bytes + payload + sizeof(float));
         float ip = 0.0f;
-        if (qnorm > 0.0f) {
+        if (qnorm > 0.0f && xnorm > 0.0f) {
             if constexpr (Bits == 1) {
-                const float acc = detail::dot1<Isa>(
-                    qrot, bytes, self->padded_, self->inv_sqrt_d_);
-                ip = acc / dot_factor;
+                ip = detail::dot1<Isa>(qrot, bytes, self->padded_, self->inv_sqrt_d_) / dot_factor;
             } else {
-                float sum_q = 0.0f;
-                std::memcpy(&sum_q, qrot + self->padded_ + 1, sizeof(float));
-                const float acc =
-                    (Bits == 4)
-                        ? detail::dot4<Isa>(qrot, bytes, self->padded_)
-                        : detail::dot8<Isa>(qrot, bytes, self->padded_);
+                const float sum_q = common::loadUnaligned<float>(qrot + self->padded_ + 1);
+                const float acc = (Bits == 4) ? detail::dot4<Isa>(qrot, bytes, self->padded_)
+                                              : detail::dot8<Isa>(qrot, bytes, self->padded_);
                 ip = (acc - self->center_ * sum_q) / dot_factor;
             }
         }
-        return xnorm * xnorm + qnorm * qnorm - 2.0f * xnorm * qnorm * ip;
+        return std::max(0.0f, xnorm * xnorm + qnorm * qnorm - 2.0f * xnorm * qnorm * ip);
     }
 
-    static DistFunc selectDist(int bits) {
-#if defined(TURBOQUANT_RABITQ_AVX2)
-        if (bits == 1)
-            return &RaBitQSpace::distKernel<1, detail::DotIsa::Avx2>;
-        if (bits == 4)
-            return &RaBitQSpace::distKernel<4, detail::DotIsa::Avx2>;
-        return &RaBitQSpace::distKernel<8, detail::DotIsa::Avx2>;
-#elif defined(TURBOQUANT_RABITQ_NEON)
-        if (bits == 1)
-            return &RaBitQSpace::distKernel<1, detail::DotIsa::Neon>;
-        if (bits == 4)
-            return &RaBitQSpace::distKernel<4, detail::DotIsa::Neon>;
-        return &RaBitQSpace::distKernel<8, detail::DotIsa::Neon>;
-#else
-        if (bits == 1)
-            return &RaBitQSpace::distKernel<1, detail::DotIsa::Scalar>;
-        if (bits == 4)
-            return &RaBitQSpace::distKernel<4, detail::DotIsa::Scalar>;
-        return &RaBitQSpace::distKernel<8, detail::DotIsa::Scalar>;
+    // Quantized-query 1-bit kernel (popcount).
+    float distBitwiseWith(const void *prepared, const void *slot,
+                          bitwise::BitwiseFn fn) const {
+        using bitwise::QueryHeader;
+        QueryHeader h;
+        std::memcpy(&h, prepared, sizeof(h));
+        const auto *bytes = static_cast<const uint8_t *>(slot);
+        const size_t payload = payloadBytes();
+        const float xnorm = common::loadUnaligned<float>(bytes + payload);
+        const float dot_factor = common::loadUnaligned<float>(bytes + payload + sizeof(float));
+        float ip = 0.0f;
+        if (h.qnorm > 0.0f && xnorm > 0.0f) {
+            uint64_t acc = 0, pop = 0;
+            fn(bytes, static_cast<const uint8_t *>(prepared) + sizeof(QueryHeader),
+               bitwise::planeWords(padded_), query_bits_, &acc, &pop);
+            ip = bitwise::estimateDot(h, acc, pop, inv_sqrt_d_) / dot_factor;
+        }
+        return std::max(0.0f, xnorm * xnorm + h.qnorm * h.qnorm - 2.0f * xnorm * h.qnorm * ip);
+    }
+
+    static float distBitwise(const void *prepared, const void *slot, const void *param) {
+        const auto *self = static_cast<const RaBitQSpace *>(param);
+        return self->distBitwiseWith(prepared, slot, self->bitwise_);
+    }
+
+    template <detail::DotIsa Isa>
+    DistFunc selectFloatDist() const {
+        if (bits_ == 1)
+            return &RaBitQSpace::distKernel<1, Isa>;
+        if (bits_ == 4)
+            return &RaBitQSpace::distKernel<4, Isa>;
+        return &RaBitQSpace::distKernel<8, Isa>;
+    }
+
+    DistFunc selectDist() const {
+        if (bitwiseQuery())
+            return &RaBitQSpace::distBitwise;
+#if defined(VSQ_HAVE_AVX2_KERNELS)
+        if (isa_ == common::Isa::Avx2)
+            return selectFloatDist<detail::DotIsa::Avx2>();
 #endif
+#if defined(VSQ_NEON)
+        if (isa_ == common::Isa::Neon)
+            return selectFloatDist<detail::DotIsa::Neon>();
+#endif
+        return selectFloatDist<detail::DotIsa::Scalar>();
     }
-
-    DistFunc get_dist_func_const() const { return dist_func_; }
 
     size_t dim_;
-    size_t padded_;
     int bits_;
     uint64_t rot_seed_;
-    std::vector<float> signs_;
+    common::Rotation rot_;
+    size_t padded_;
     std::vector<float> centroid_;
     float inv_sqrt_d_;
     float center_;
     int encode_mode_;
     double t_fixed_;
+    common::Isa isa_;
+    int num_threads_;
+    int query_bits_ = 0;
     DistFunc dist_func_ = nullptr;
+    bitwise::BitwiseFn bitwise_ = nullptr;
 };
 
-}  // namespace rabitq
-
-namespace turboquant {
-using RaBitQSpace = rabitq::RaBitQSpace;
-}  // namespace turboquant
+}  // namespace vsq::rabitq

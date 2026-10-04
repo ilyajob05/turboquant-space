@@ -10,7 +10,18 @@ oracle does not import TurboQuant's Lloyd-Max helpers.
 import numpy as np
 import pytest
 
-from turboquant import RaBitQSpace
+from vsq import RaBitQSpace as _RaBitQSpace
+
+
+def RaBitQSpace(*args, **kwargs):
+    """Legacy rotation + float query: the layout the NumPy oracle mirrors.
+
+    The default space (BlockKac rotation, quantized 1-bit query) is covered by
+    test_rabitq_defaults.py.
+    """
+    kwargs.setdefault("rotation", "legacy")
+    kwargs.setdefault("query_bits", 0)
+    return _RaBitQSpace(*args, **kwargs)
 
 MASK64 = (1 << 64) - 1
 
@@ -127,9 +138,15 @@ def test_encode_bits_match_oracle(dim):
     centroid = rng.standard_normal(dim).astype(np.float32)
     x = rng.standard_normal(dim).astype(np.float32)
     space = RaBitQSpace(dim, rot_seed=seed, centroid=centroid)
-    got = space.encode(x)
-    expect = oracle_encode(x, seed, centroid)
-    np.testing.assert_array_equal(got, expect)
+    got = np.asarray(space.encode(x), dtype=np.uint8)
+    expect = np.asarray(oracle_encode(x, seed, centroid), dtype=np.uint8)
+    # Sign bits are bit-exact. The two float32 tails (norm, dot_factor) may
+    # differ in the last ulp: -ffast-math lets the compiler reorder the sums
+    # (the x86 build vectorises them), while the oracle sums sequentially.
+    payload = got.size - 8
+    np.testing.assert_array_equal(got[:payload], expect[:payload])
+    np.testing.assert_allclose(got[payload:].view(np.float32), expect[payload:].view(np.float32),
+                               rtol=1e-6)
 
 
 @pytest.mark.parametrize("dim", [8, 128])
@@ -228,7 +245,7 @@ def test_distance_kernel_matches_this_machine():
     if machine in ("arm64", "aarch64"):
         assert name == "1-neon"
     elif machine in ("x86_64", "amd64"):
-        assert name in ("1-avx2", "1-scalar")
+        assert name in ("1-avx2", "1-scalar")  # runtime CPUID dispatch
     else:
         assert name == "1-scalar"
     assert RaBitQSpace(32, bits=4).distance_kernel().startswith("4-")
@@ -244,13 +261,15 @@ def test_wrong_code_size_is_rejected():
     assert "code" in str(exc.value).lower() or "size" in str(exc.value).lower() or "byte" in str(exc.value).lower()
 
 
-def test_zero_residual_is_rejected():
+def test_zero_residual_encodes_to_centroid_distance():
+    # Review 1.5: x == c used to throw; it now encodes with norm 0 and the
+    # estimate is exactly ||q - c||^2.
     dim = 8
     c = np.arange(dim, dtype=np.float32)
     space = RaBitQSpace(dim, rot_seed=3, centroid=c)
-    with pytest.raises(Exception) as exc:
-        space.encode(c.copy())
-    assert "padded_dim=8" in str(exc.value)
+    code = space.encode(c.copy())
+    q = np.linspace(-1.0, 2.0, dim).astype(np.float32)
+    np.testing.assert_allclose(space.distance(q, code), float(np.sum((q - c) ** 2)), rtol=1e-5)
 
 
 def test_query_at_centroid_is_squared_norm():

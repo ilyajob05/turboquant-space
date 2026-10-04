@@ -2,7 +2,7 @@
 import numpy as np
 import torch
 
-from turboquant import TurboQuantSpace
+from vsq import TurboQuantSpace
 
 
 def main() -> None:
@@ -11,7 +11,7 @@ def main() -> None:
     x = torch.randn(n, dim)
     x = torch.nn.functional.normalize(x, dim=1)
 
-    tq = TurboQuantSpace(dim=dim, bits_per_coord=8)
+    tq = TurboQuantSpace(dim, 8, centering="none")  # no training step
 
     x_np = x.detach().cpu().numpy().astype(np.float32, copy=False)
     x_np = np.ascontiguousarray(x_np)

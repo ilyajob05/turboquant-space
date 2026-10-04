@@ -53,7 +53,7 @@ from pathlib import Path
 
 import numpy as np
 
-from turboquant import RaBitQSpace, TurboQuantSpace
+from vsq import RaBitQSpace, TurboQuantSpace
 
 _ALLOWED_BITS = {
     "turboquant": (4, 8),
@@ -284,9 +284,7 @@ class TurboQuantRunner:
     search_api = "distance_1_to_n"
 
     def __init__(self, dim: int, bits: int, rot_seed: int) -> None:
-        self.space = TurboQuantSpace(
-            dim, bits_per_coord=bits, rot_seed=rot_seed, num_threads=1
-        )
+        self.space = TurboQuantSpace(dim, bits, rot_seed=rot_seed, num_threads=1)
         self.bits = bits
 
     @property
@@ -306,6 +304,8 @@ class TurboQuantRunner:
         return "distance_1_to_n"
 
     def encode(self, vectors: np.ndarray) -> np.ndarray:
+        if not self.space.trained():  # format v2 IVF centering is fitted once
+            self.space.train(np.ascontiguousarray(vectors[:65536]))
         codes = self.space.encode_batch(vectors)
         expected = (vectors.shape[0], self.code_bytes)
         if codes.shape != expected or codes.dtype != np.uint8:
@@ -467,7 +467,7 @@ def write_markdown(path: Path, rows: list[dict], stamp: str, host: str) -> None:
         f"# Quantizer comparison {stamp}",
         "",
         f"Host `{host}`, Python {rows[0]['python']}, "
-        f"turboquant {rows[0]['package_version']}.",
+        f"vsq {rows[0]['package_version']}.",
         "",
         "Shared float32 N(0, 1) draw per dimension. "
         f"Accuracy uses n_base={rows[0]['n_base']}, n_query={rows[0]['n_query']}, "
@@ -591,9 +591,9 @@ def main() -> None:
     host = f"{platform.system()} {platform.machine()}"
     py = platform.python_version()
     try:
-        import turboquant
+        import vsq
 
-        version = turboquant.__version__
+        version = vsq.__version__
     except Exception:
         version = "unknown"
 

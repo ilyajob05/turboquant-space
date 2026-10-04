@@ -35,15 +35,16 @@ jobs:
           CIBW_SKIP: "*-musllinux_* pp*"
           CIBW_BUILD_VERBOSITY: 1
           CIBW_ENVIRONMENT: >-
-            CMAKE_ARGS="-DTURBOQUANT_PORTABLE=ON"
+            CMAKE_ARGS="-DVSQ_PORTABLE=ON"
           CIBW_BEFORE_BUILD_MACOS: brew install libomp
           CIBW_TEST_REQUIRES: pytest numpy
           CIBW_TEST_COMMAND: pytest {project}/python/tests -v
-          # macOS x86_64 runners may lack AVX2; MSVC /arch:AVX2 also requires it,
-          # but the portable Linux baseline (x86-64-v3) implies AVX2 as well.
+          # Portable baseline: x86-64 (SSE2) / armv8-a. AVX2 kernels are chosen
+          # at runtime by CPUID, so wheels run on CPUs without AVX2 (scalar).
+          # MSVC has no target attributes and still builds with /arch:AVX2.
           MACOSX_DEPLOYMENT_TARGET: "15.0"
           CIBW_ENVIRONMENT_WINDOWS: >-
-            CMAKE_ARGS="-DTURBOQUANT_PORTABLE=ON -DOpenMP_CXX_FLAGS=/openmp"
+            CMAKE_ARGS="-DVSQ_PORTABLE=ON -DOpenMP_CXX_FLAGS=/openmp"
             CMAKE_GENERATOR="Ninja"
           CIBW_BEFORE_BUILD_WINDOWS: "pip install ninja"
 
@@ -79,7 +80,7 @@ jobs:
     if: github.event_name == 'release'
     environment:
       name: pypi
-      url: https://pypi.org/p/turboquant-space
+      url: https://pypi.org/p/vsq
     permissions:
       id-token: write
     steps:

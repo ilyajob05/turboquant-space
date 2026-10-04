@@ -4,7 +4,7 @@ Measured performance of `turboquant-space` across platforms. Numbers are
 raw throughput of the distance/encoding kernels — no index overhead, no
 Python-side batching tricks. See `python/benchmarks/run_benchmark.py` for
 the reproducible sweep (recall + scaling plots); the tables below come from
-`python/tests/performance_check.py`, which is a tighter microbenchmark
+`python/tests/performance_check.py` (0.1.x, since removed), a tighter microbenchmark
 meant for quick platform-to-platform comparison.
 
 All distance rows report a single unit — **distances/sec** — so asymmetric

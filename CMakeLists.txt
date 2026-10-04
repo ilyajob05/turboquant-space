@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18...4.31)
 
-project(turboquant_space LANGUAGES CXX)
+project(vsq LANGUAGES CXX)
 
 # Writes compile_commands.json into the build tree for clangd (Serena cpp).
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -25,9 +25,9 @@ endif()
 
 find_package(pybind11 REQUIRED PATHS ${PYBIND11_DIR} NO_DEFAULT_PATH)
 
-pybind11_add_module(_turboquant python/turboquant/bindings.cpp)
+pybind11_add_module(_vsq python/vsq/bindings.cpp)
 
-target_include_directories(_turboquant PRIVATE
+target_include_directories(_vsq PRIVATE
     ${PROJECT_SOURCE_DIR}/include
 )
 
@@ -77,32 +77,32 @@ endif()
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
     message(STATUS "OpenMP found: parallel batch ops enabled")
-    target_link_libraries(_turboquant PRIVATE OpenMP::OpenMP_CXX)
-    target_compile_definitions(_turboquant PRIVATE TURBOQUANT_HAVE_OPENMP)
+    target_link_libraries(_vsq PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_definitions(_vsq PRIVATE VSQ_HAVE_OPENMP)
 
     # On macOS, rewrite the libomp install name in the .so so dyld resolves it
     # via @rpath, and add rpaths to both torch's lib dir and Homebrew's libomp
-    # dir. This way torch and turboquant share the same loaded libomp instance,
+    # dir. This way torch and vsq share the same loaded libomp instance,
     # avoiding the "OMP: Error #15: ... already initialized" abort.
     if(APPLE AND LIBOMP_LIBRARY)
         # Search torch's bundled libomp first (relative to the .so's install
-        # location: site-packages/turboquant/_turboquant.so → ../torch/lib).
+        # location: site-packages/vsq/_vsq.so → ../torch/lib).
         # If torch isn't installed, fall back to Homebrew's libomp via @loader_path.
         # @loader_path lets the .so find a sibling libomp.dylib if we ever ship one.
-        set_target_properties(_turboquant PROPERTIES
+        set_target_properties(_vsq PROPERTIES
             BUILD_WITH_INSTALL_RPATH TRUE
             INSTALL_RPATH "@loader_path/../torch/lib;@loader_path;/opt/homebrew/opt/libomp/lib;/usr/local/opt/libomp/lib"
         )
-        add_custom_command(TARGET _turboquant POST_BUILD
+        add_custom_command(TARGET _vsq POST_BUILD
             COMMAND install_name_tool -change
                 "${LIBOMP_LIBRARY}" "@rpath/libomp.dylib"
-                "$<TARGET_FILE:_turboquant>"
+                "$<TARGET_FILE:_vsq>"
             COMMAND install_name_tool -change
                 "/opt/llvm-openmp/lib/libomp.dylib" "@rpath/libomp.dylib"
-                "$<TARGET_FILE:_turboquant>" || true
+                "$<TARGET_FILE:_vsq>" || true
             COMMAND install_name_tool -change
                 "/opt/homebrew/opt/libomp/lib/libomp.dylib" "@rpath/libomp.dylib"
-                "$<TARGET_FILE:_turboquant>" || true
+                "$<TARGET_FILE:_vsq>" || true
             COMMENT "Rewriting libomp install name to @rpath/libomp.dylib"
         )
     endif()
@@ -110,42 +110,61 @@ else()
     message(STATUS "OpenMP not found: batch ops will run single-threaded")
 endif()
 
-set_target_properties(_turboquant PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python/turboquant"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python/turboquant"
+set_target_properties(_vsq PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python/vsq"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python/vsq"
 )
 
-# TURBOQUANT_PORTABLE=ON  → conservative baseline for prebuilt wheels
-#                           (x86-64-v3 on x64, armv8-a on arm64, /arch:AVX2 on MSVC).
-# TURBOQUANT_PORTABLE=OFF → -march=native, tuned for the build machine.
+# VSQ_PORTABLE=ON  → baseline ISA for prebuilt wheels: x86-64 (SSE2) on
+#                           x64, armv8-a on arm64. AVX2 kernels are still built
+#                           (target attributes) and chosen at runtime by CPUID,
+#                           so a wheel never raises SIGILL on an older CPU.
+#                           MSVC has no target attributes: /arch:AVX2 there.
+# VSQ_PORTABLE=OFF → -march=native, tuned for the build machine.
 # Default is OFF so local `pip install` / `uv sync` get max performance;
 # cibuildwheel sets it to ON to produce portable wheels.
-option(TURBOQUANT_PORTABLE "Build with a portable CPU baseline instead of -march=native" OFF)
+option(VSQ_PORTABLE "Build with a portable CPU baseline instead of -march=native" OFF)
 
 if(MSVC)
-    target_compile_options(_turboquant PRIVATE /O2 /fp:fast /arch:AVX2)
+    target_compile_options(_vsq PRIVATE /O2 /fp:fast /arch:AVX2)
 else()
-    target_compile_options(_turboquant PRIVATE
+    target_compile_options(_vsq PRIVATE
         -O3
         -ffast-math
         -fno-finite-math-only
     )
-    if(TURBOQUANT_PORTABLE)
+    if(VSQ_PORTABLE)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
-            target_compile_options(_turboquant PRIVATE -march=x86-64-v3)
+            target_compile_options(_vsq PRIVATE -march=x86-64)
         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
-            target_compile_options(_turboquant PRIVATE -march=armv8-a)
+            target_compile_options(_vsq PRIVATE -march=armv8-a)
         endif()
     else()
-        target_compile_options(_turboquant PRIVATE -march=native)
+        target_compile_options(_vsq PRIVATE -march=native)
     endif()
 endif()
 
-target_compile_definitions(_turboquant PRIVATE
+target_compile_definitions(_vsq PRIVATE
     $<$<CONFIG:Debug>:DEBUG_MODE>
     $<$<CONFIG:Release>:NDEBUG>
 )
 
+# C++ unit tests (header-only library; no Python needed at run time).
+option(VSQ_BUILD_TESTS "Build the C++ tests in tests/cpp" OFF)
+if(VSQ_BUILD_TESTS)
+    enable_testing()
+    add_executable(test_core tests/cpp/test_core.cpp)
+    target_include_directories(test_core PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    if(NOT MSVC)
+        target_compile_options(test_core PRIVATE -O2 -Wall -Wextra -ffast-math -fno-finite-math-only)
+    endif()
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(test_core PRIVATE OpenMP::OpenMP_CXX)
+        target_compile_definitions(test_core PRIVATE VSQ_HAVE_OPENMP)
+    endif()
+    add_test(NAME test_core COMMAND test_core)
+endif()
+
 # Install the compiled module next to the Python package sources so
-# `from turboquant import _turboquant` resolves inside the installed wheel.
-install(TARGETS _turboquant LIBRARY DESTINATION turboquant)
+# `from vsq import _vsq` resolves inside the installed wheel.
+install(TARGETS _vsq LIBRARY DESTINATION vsq)

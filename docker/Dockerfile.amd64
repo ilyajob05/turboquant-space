@@ -1,0 +1,17 @@
+# x86-64 test image (review item 3.1): toolchain only, the source is mounted.
+#
+# On Apple Silicon the container runs emulated, and neither Docker's Rosetta
+# backend nor plain binfmt expose AVX2 to the guest. qemu-user (`qemu-x86_64
+# -cpu max`, TCG >= 7.2) does emulate AVX2/FMA/F16C/BMI2, so docker/test_amd64.sh
+# runs every test twice: as is (runtime dispatch must fall back to scalar
+# without SIGILL) and under qemu-user (the AVX2 kernels must be selected and
+# agree with scalar). On a real x86 host with AVX2 both runs use AVX2.
+FROM --platform=linux/amd64 python:3.12-slim-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential cmake ninja-build qemu-user \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir "scikit-build-core>=0.10" "pybind11>=2.13" numpy scipy pytest
+
+WORKDIR /work

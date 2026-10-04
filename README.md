@@ -1,308 +1,250 @@
-# turboquant-space
+# vsq — vector search quantization
 
-![License](https://img.shields.io/pypi/l/turboquant-space)
+![License](https://img.shields.io/pypi/l/vsq)
 ![Build](https://img.shields.io/github/actions/workflow/status/ilyajob05/turboquant-space/publish.yml)
-![Python](https://img.shields.io/pypi/pyversions/turboquant-space)
-![PyPI](https://img.shields.io/pypi/v/turboquant-space)
+![Python](https://img.shields.io/pypi/pyversions/vsq)
+![PyPI](https://img.shields.io/pypi/v/vsq)
 
+Vector quantization for approximate nearest-neighbour search: **TurboQuant**
+(ICLR 2026, arXiv:2504.19874) and **RaBitQ / Extended RaBitQ** (SIGMOD 2024,
+arXiv:2409.09913). Header-only C++17 with Python bindings, SIMD kernels
+(AVX2 chosen at runtime, NEON on arm64), designed to be embedded in
+[hnswlib](https://github.com/nmslib/hnswlib) as a distance space.
 
-
-This library was inspired by the article https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/. The library is optimized for efficient data allocation in memory for 3+1 and 7+1 bit quantization schemes.
-
-SIMD-accelerated 4/8-bit vector quantization for approximate nearest neighbor
-search, based on **TurboQuant** (ICLR 2026). Standalone C++17 library with
-Python bindings.
 ```bash
-pip install turboquant-space
+pip install vsq
 ```
 
 ```python
-from turboquant import TurboQuantSpace
 import numpy as np
+from vsq import TurboQuantSpace
 
-space = TurboQuantSpace(dim=128, bits_per_coord=8, num_threads=4)
-X = np.random.randn(100_000, 128).astype(np.float32)
-q = np.random.randn(128).astype(np.float32)
+X = np.random.randn(100_000, 768).astype(np.float32)
+q = np.random.randn(768).astype(np.float32)
 
-codes = space.encode_batch(X)              # (100_000, code_size) uint8
-dists = space.distance_1_to_n(q, codes)    # (100_000,) float32
+space = TurboQuantSpace(768, bits=4)      # format v2, IVF centering by default
+space.train(X)                             # fit the centroids once
+codes = space.encode_batch(X)              # (100_000, 398) uint8
+dists = space.distance_1_to_n(q, codes)    # (100_000,) float32, squared L2
 ```
 
-That is the whole mental model: `encode` once, then `distance_*` against the
-codes. No index to build, no state to persist beyond `codes`.
+`encode` once, then `distance_*` against the codes. The space itself is the
+only state besides the codes; it pickles (with a format version).
 
-### Torch Example
-```python
-from turboquant import TurboQuantSpace
-import numpy as np
-torch.manual_seed(42)
-n, dim = 10000, 768
-x = torch.randn(n, dim)
-x = torch.nn.functional.normalize(x, dim=1)
-
-tq = TurboQuantSpace(dim=dim, bits_per_coord=8)
-
-x_np = x.detach().cpu().numpy().astype(np.float32, copy=False)
-x_np = np.ascontiguousarray(x_np)
-codes = tq.encode_batch(x_np)
-
-raw_bytes = x.numel() * 4
-comp_bytes = codes.nbytes
-print(f"raw   : {raw_bytes / 1e6:.2f} MB")
-print(f"codes : {comp_bytes / 1e6:.2f} MB  ({raw_bytes / comp_bytes:.1f}x)")
-print(f"code_size_bytes = {tq.code_size_bytes()}")
-
-q = x_np[0]
-d = tq.distance_1_to_n(q, codes)
-print("top-5 nearest:", np.argsort(d)[:5])
-
-```
 ---
 
-## What it does, briefly
+## What it does
 
-TurboQuant encodes each float32 vector into a compact code of
-`bits_per_coord` bits per coordinate using a randomized Walsh–Hadamard
-rotation followed by Lloyd–Max scalar quantization, plus one QJL sign bit per
-coordinate for an unbiased residual correction. Distances between a raw query
-and a packed code (asymmetric) or between two packed codes (symmetric) are
-computed directly on the quantized representation with hand-written NEON /
-SSE / AVX kernels.
+A vector `x` is encoded relative to a centroid `c` (none, the dataset mean, or
+the nearest of `k` k-means centroids). The unit residual `(x - c) / ||x - c||`
+is rotated by a random orthogonal transform (signs + Walsh–Hadamard blocks)
+so its coordinates are approximately i.i.d. Gaussian, then quantized per
+coordinate with a Lloyd–Max quantizer (4 or 8 bits) or stored as fp16
+(16 bits). A per-code scale makes the inner-product estimate unbiased
+(RaBitQ-style correction). Distances are computed directly on the codes:
 
-**Concretely you get:**
+* **asymmetric** — raw query × code (search), one rotation per query;
+* **symmetric** — code × code (graph construction, e.g. HNSW links).
 
-| bits_per_coord | layout               | bytes / vec (dim=128) | compression vs fp32 |
-|----------------|----------------------|-----------------------|---------------------|
-| 4              | nibble-packed        | 76                    | 6.7×                |
-| 8              | one byte per coord   | 140                   | 3.7×                |
+### Design decisions (measured, see `.agent/planning/plan.md`)
 
-(Plus 12 bytes of metadata — norm, γ, σ — per code.)
-
-**What it is not:** not a graph index, not an IVF, not a drop-in replacement
-for FAISS. It is the *distance* layer. Plug it into your own index, or use
-`distance_1_to_n` as brute-force search on batches up to a few million.
+| question | decision | evidence (recall@10, 4 bits/coord) |
+|---|---|---|
+| spend 1 bit on QJL or on MSE? | MSE + correction by default; QJL optional | openai-v3-small .973 vs .966; msmarco .962 vs .941; SIFT .857 vs .630 |
+| centering | IVF (k = 256) by default | openai-v3-large .987 (ivf) vs .985 (mean) vs .975 (none); SIFT .925–.932 vs .857 |
+| padding | multiple of 64, not a power of two | 1536 stays 1536 (was 2048: −25% code size and compute) |
 
 ---
 
 ## Install
 
-```bash
-pip install turboquant-space
-```
-
-Prebuilt wheels are published for CPython 3.11–3.13 on Linux (x86\_64,
-aarch64), macOS (x86\_64, arm64), and Windows (AMD64). They target a
-conservative CPU baseline — **x86-64-v3** (AVX2 + FMA + BMI2) on x64 and
-**armv8-a** (NEON) on arm64 — so a single wheel runs on anything produced in
-the last ~8 years. A C++ compiler is **not** required for this path.
-
-### Build from source for maximum performance
-
-The prebuilt wheels trade a few percent for portability. If you have a C++
-compiler and want the binary tuned to *your* CPU (AVX-512 on Zen4 / Ice Lake,
-SVE on Graviton, etc.), force pip to skip the wheel and compile from sdist:
+Prebuilt wheels: CPython 3.11–3.13 on Linux (x86\_64, aarch64) and macOS
+(x86\_64, arm64). Wheels are compiled for the **baseline** ISA (x86-64 /
+armv8-a); the AVX2 + FMA kernels are compiled in with target attributes and
+selected **at runtime by CPUID**, so one wheel is fast on AVX2 machines and
+still runs (scalar) on older x86 CPUs. `vsq.detected_isa()` reports
+the choice (`"avx2"`, `"neon"` or `"scalar"`).
 
 ```bash
-pip install turboquant-space --no-binary turboquant-space
+pip install vsq --no-binary vsq   # build with -march=native
+git clone https://github.com/ilyajob05/turboquant-space && cd turboquant-space && uv sync
 ```
 
-This invokes CMake with `-march=native`, so every available instruction set
-on the build machine is enabled. Requires CMake ≥ 3.18 and a C++17 compiler;
-on macOS also `brew install libomp` for multi-threaded batch ops.
-
-### From a git checkout
-
-```bash
-git clone https://github.com/ilyajob05/turboquant-space
-cd turboquant-space
-uv sync                       # or: pip install -e .
-```
-
-Same story: local builds use `-march=native` by default. Pass
-`-DTURBOQUANT_PORTABLE=ON` to CMake if you need a portable baseline instead.
+Source builds need CMake ≥ 3.18 and a C++17 compiler (`brew install libomp`
+on macOS for OpenMP). `-DVSQ_PORTABLE=ON` selects the wheel baseline.
 
 ---
 
-## API
-
-Everything lives on a single class, `TurboQuantSpace`. All numpy arrays are
-`float32`, C-contiguous; all codes are `uint8`.
+## TurboQuantSpace (format v2)
 
 ```python
 TurboQuantSpace(
-    dim: int,                    # input dimensionality (any positive integer)
-    bits_per_coord: int = 4,     # 2..9 — nibble-packed for bits<=4
-    rot_seed: int = 42,          # Hadamard rotation seed
-    qjl_seed: int = 137,         # QJL sign seed
-    num_threads: int = 0,        # 0 = use OMP_NUM_THREADS / all cores
+    dim: int,                      # input dimension >= 1
+    bits: int = 4,                 # 4 | 8 | 16 stored bits per coordinate (16 = fp16)
+    *,
+    qjl: bool = False,             # 4/8 only: one of `bits` becomes a QJL sign bit
+    estimator: str = "corrected",  # "corrected" (unbiased scale) | "plain"
+    qjl_cross: str = "linear",     # full-symmetric <e_a, e_b> term: "linear" | "arcsine"
+    centering: str = "ivf",        # "none" | "mean" | "ivf"
+    n_clusters: int = 256,         # ivf: requested k (<= n_train / 39, <= 65535)
+    rotation_rounds: int = 3,      # rounds of the block Walsh–Hadamard/Kac rotation
+    rot_seed: int = 42, qjl_seed: int = 137,
+    num_threads: int = 0,          # batch helpers; 0 = OpenMP default
+    isa: str = "auto",             # "auto" | "scalar" | "neon" | "avx2" (clamped to the CPU)
 )
 ```
 
-| method                                    | shape in                     | shape out                   |
-|-------------------------------------------|------------------------------|-----------------------------|
-| `encode(x)`                               | `(dim,)`                     | `(code_size_bytes,)` uint8  |
-| `encode_batch(X)`                         | `(n, dim)`                   | `(n, code_size_bytes)` uint8|
-| `encode_into(x, out)` / `encode_batch_into` | in-place into caller buffer | —                           |
-| `distance(query, code)`                   | `(dim,)`, `(code_size,)`     | `float`                     |
-| `distance_symmetric(code_a, code_b)`      | `(code_size,)` ×2            | `float`                     |
-| `distance_1_to_n(q, codes)`               | `(dim,)`, `(n, code_size)`   | `(n,)` float32              |
-| `distance_m_to_n(Q, codes)`               | `(m, dim)`, `(n, code_size)` | `(m, n)` float32            |
-| `distance_m_to_n_symmetric(codes_a, b)`   | `(m, cs)`, `(n, cs)`         | `(m, n)` float32            |
+| method | input | output |
+|---|---|---|
+| `train(X, seed=1234, iters=10)` | `(n, dim)` float32 | fits mean / k-means centroids |
+| `set_centroids(C)` / `centroids()` | `(k, dim)` float32 | |
+| `encode(x)` / `encode_batch(X)` | `(dim,)` / `(n, dim)` | `(cs,)` / `(n, cs)` uint8 |
+| `encode_into(x, out)` / `encode_batch_into(X, out)` | caller-owned buffers | |
+| `decode(code)` | `(cs,)` | `(dim,)` approximate reconstruction |
+| `distance(q, code)` | `(dim,)`, `(cs,)` | float |
+| `distance_1_to_n(q, codes)` | `(dim,)`, `(n, cs)` | `(n,)` |
+| `distance_m_to_n(Q, codes)` | `(m, dim)`, `(n, cs)` | `(m, n)` (tiled) |
+| `distance_symmetric(a, b)` / `distance_m_to_n_symmetric(A, B)` | codes | float / `(m, n)` |
+| `distance_symmetric_full(a, b)` / `distance_m_to_n_symmetric_full(A, B)` | codes (qjl spaces) | full 4-term QJL estimate |
 
-Accessors: `dim()`, `padded_dim()`, `padded()`, `num_threads()`,
-`code_size_bytes()`, `bits_per_coord()`.
+Accessors: `dim()`, `padded_dim()`, `bits()`, `qjl()`, `centering()`,
+`n_clusters()`, `trained()`, `code_size_bytes()`, `kernel_isa()`,
+`num_threads()`, `rotation_rounds()`, `format_version()` (static, `2`).
 
-### Dimensionality padding
+All array arguments must be **C-contiguous** with the exact dtype (float32
+vectors, uint8 codes); strided views raise `ValueError` instead of being read
+with the wrong layout. Distances are squared L2, clamped at 0.
 
-Internally every operation works in a power-of-two dimension (a requirement
-of the Walsh–Hadamard transform). If you pass `dim=100`, the space rounds up
-to 128 and zero-pads on the fly; a one-time warning is printed, and
-`space.padded_dim()` reports the internal size. Correctness is preserved —
-zero-padding in ℝᵈ does not change L2 distances — but encode/query cost is
-determined by `padded_dim()`, not `dim()`.
+### Code layout (v2)
 
-### Threading
+`D` = `dim` rounded up to a multiple of 64. Little-endian, no alignment.
 
-All batch methods (`encode_batch`, `distance_1_to_n`, `distance_m_to_n`,
-`distance_m_to_n_symmetric`) parallelize the outer loop with OpenMP,
-`schedule(static)`, so each thread owns a contiguous range of codes —
-prefetcher-friendly, no false sharing on output rows. Set `num_threads` in
-the constructor, or leave it `0` to respect `OMP_NUM_THREADS`. For small
-batches (≤ 64) execution stays single-threaded to avoid fork/join overhead.
+| field | type | present | meaning |
+|---|---|---|---|
+| payload | `D/2` B (4-bit), `D` B (8-bit), `2D` B (fp16) | always | per-coordinate index, low nibble = even coordinate; with QJL the unit is `idx << 1 \| sign` |
+| `f_sq` | float32 | always | `‖x − c‖²` |
+| `f_mul` | float32 | always | `‖x − c‖ · s / √D` (`s` = estimator scale) |
+| `f_ct` | float32 | ivf | estimate of `⟨c, x − c⟩` |
+| `f_qjl` | float32 | qjl | `‖x − c‖ · √(π/2) / √D · γ` |
+| `cid` | uint16 | ivf | cluster id |
 
-Observed scaling on Apple M-series, dim=512, 50k codes × 128 queries, bits=8:
-**1→2 = 1.94×, 1→4 = 3.49×, 1→8 = 4.50×** — see `python/benchmarks/` for the
-full reproduction.
+`code_size_bytes() = D·bits/8 + 8` (+4 ivf, +4 qjl, +2 ivf). At dim 1536 /
+4 bits: 782 B.
+
+### Centering
+
+`train(X)` is required for `mean` and `ivf` (encoding an untrained space
+raises `RuntimeError`); `centering="none"` needs no training. IVF adds one
+k-float table per query (`‖q − c_j‖²`), not per code, and symmetric distances
+between codes of different clusters use the rotated centroids (one fused
+pass). Bring your own centroids (e.g. from FAISS) with `set_centroids`.
+
+### HNSW integration, threading, ISA
+
+* Per-pair distance functions never allocate, never throw and never spawn
+  threads; C++ adapters with hnswlib's `DISTFUNC` signature are
+  `TurboQuantSpace::searchDistFunc` (prepared query × code) and
+  `buildDistFunc` (code × code).
+* Batch helpers (`encode_batch`, `distance_*_to_n`) use OpenMP; the Python
+  bindings release the GIL. `distance_m_to_n` tiles queries × codes so the
+  codes stay in cache.
+* Kernels: AVX2 (runtime CPUID), NEON (aarch64), scalar reference. All macros
+  are prefixed `VSQ_` and all code lives in namespace `vsq`, so the headers can
+  sit next to hnswlib.
 
 ---
 
-## RaBitQ
-
-`RaBitQSpace` is the other quantizer in this package. It scores asymmetric
-squared L2 on an Extended RaBitQ grid (centers 7.5 at 4 bits and 127.5 at
-8 bits), not Lloyd–Max. Legal bit widths are 1, 4, and 8. The constructor
-default is 1 bit. A zero residual raises.
+## RaBitQSpace
 
 ```python
-import numpy as np
-from turboquant import RaBitQSpace
-
-space = RaBitQSpace(dim=128, bits=4)  # 4/8-bit default: fixed_scale
-X = np.random.randn(1000, 128).astype(np.float32)
-q = np.random.randn(128).astype(np.float32)
-codes = space.encode_batch(X)          # (1000, code_size_bytes) uint8
-dists = space.distance_1_to_n(q, codes)
+RaBitQSpace(dim, rot_seed=42, centroid=None, bits=1, encode_mode=None, *,
+            rotation="kac",        # "kac" (default) | "legacy" (0.1.x codes)
+            rotation_rounds=3,
+            query_bits=None,       # 1-bit: 4 (paper's B_q, popcount); 0 = float query
+            num_threads=0, isa="auto")
 ```
 
-`encode_mode` selects how a 4-bit or 8-bit code is scaled. Omit it and the
-mode follows `bits`.
-
-| `encode_mode` | when it is used | what the scale is |
-|---|---|---|
-| `fixed_scale` | default at 4 and 8 bits | one positive `t` for the whole space, frozen in the constructor |
-| `windowed_scale` | pass it explicitly | one `t` per vector, inside a tight window |
-| `algorithm1` | default at 1 bit; pass it explicitly at 4 or 8 | bit-exact Extended RaBitQ sweep of every threshold |
-
-`fixed_scale()` returns that frozen `t` as a Python float. It is 0 for
-`algorithm1` and `windowed_scale`. The frozen value is the mean Algorithm 1
-plateau edge over 100 standard-normal residuals (seed 42). At 8 bits and
-dim 128 one global scale loses a little recall against `algorithm1`; the
-other measured cells stay within 0.01 recall@10. The numbers and the
-caveat are in [`docs/benchmarks.md`](docs/benchmarks.md).
-
-`fixed_scale` and `windowed_scale` with `bits=1` raise. Encode has no inner
-thread pool: one space may be called from several outer threads. The batch
-is one serial C++ pass over rows.
+* `bits` ∈ {1, 4, 8}. 1-bit distances use the paper's quantized query:
+  `(B_q + 1) · D/64` popcounts per code instead of `D` float FMAs.
+* `distance_bound(q, code, eps0=1.9)` → `(estimate, lower, upper)` from the
+  RaBitQ error bound (≈94% coverage at `eps0 = 1.9`).
+* `x == centroid` encodes to an exact `‖q − c‖²` (it used to raise).
+* `encode_mode` (4/8-bit): `fixed_scale` (default), `windowed_scale`,
+  `algorithm1` (bit-exact Extended RaBitQ; its sort is a 4-pass radix).
+* RaBitQ is asymmetric only — do not use it as the HNSW link metric.
 
 ---
+
+## FastScan (flat 1-to-N)
+
+HNSW needs per-pair distances; flat scans and re-ranking use the FastScan
+block layout (32 codes, 4-bit sub-codes, PSHUFB/TBL lookups):
+
+```python
+from vsq import TurboQuantFastScan, RaBitQFastScan
+
+index = TurboQuantFastScan(space, codes)        # 4-bit TurboQuant, no qjl
+ids, dists = index.search(q, k=10, rerank=4)    # FastScan, then exact re-score
+
+rq = RaBitQSpace(768, bits=4)
+rindex = RaBitQFastScan(rq, X)                  # two-stage search from the paper
+ids, dists, n_refined = rindex.search(q, k=10)  # 1-bit estimate + bound, refine
+```
+
+---
+
+## Layout
+
+C++ namespaces mirror the `include/` directories under the project prefix
+`vsq`: `vsq::common`, `vsq::turboquant`, `vsq::rabitq`. The two algorithms
+never see each other's names; shared code is always called with an explicit
+`common::` qualifier. Macros use the same prefix (`VSQ_`).
+
+```
+include/
+  common/            shared by both algorithms
+    config.h         ISA/CPUID dispatch, OpenMP, VSQ_ macros
+    fp16.h vecops.h  half floats, small vector helpers
+    srht.h           SRHT primitives (RaBitQ "legacy" rotation)
+    rotation.h       block Walsh–Hadamard + Kac rotation; LegacySrht
+    fastscan.h       FastScan engine (32-code blocks, 4-bit LUT scan)
+  turboquant/        TurboQuant
+    space.h          TurboQuantSpace (code format v2)
+    kernels.h        kernels_{scalar,neon,avx2}.h dispatch
+    lloyd_max.h      Lloyd–Max tables, branch-free quantizer
+    kmeans.h centering.h
+    fastscan.h       TurboQuantFastScan (4-bit codes)
+  rabitq/            RaBitQ / Extended RaBitQ
+    space.h          RaBitQSpace
+    kernels.h        float-query kernels
+    bitwise.h        quantized query + popcount (1-bit)
+    fastscan.h       RaBitQFastScan (two-stage search)
+python/vsq/          bindings.cpp, __init__.py, _vsq.pyi
+tests/cpp/           test_core.cpp (copy safety, SIMD == scalar)
+docker/              amd64 test image + script (AVX2 via qemu-user)
+```
+
+## Tests
+
+```bash
+uv run pytest python/tests/ -v                                  # Python suite
+cmake -S . -B build -DVSQ_BUILD_TESTS=ON && cmake --build build --target test_core && ctest --test-dir build
+docker/test_amd64.sh                                             # x86-64: scalar fallback + AVX2 (qemu-user)
+```
 
 ## Benchmarks
 
 ```bash
-uv run python python/benchmarks/run_benchmark.py
+uv run python python/benchmarks/run_benchmark.py            # SIFT1M + synthetic sweep
+uv run python python/benchmarks/compare_quantizers.py       # TurboQuant vs RaBitQ
 ```
 
-On first run this downloads SIFT1M (~170 MB) to
-`~/.cache/turboquant/sift/`; subsequent runs reuse the cache. The script
-sweeps `bits_per_coord × num_threads` on SIFT1M (with recall@{1,10,100}
-against the shipped ground truth) and on synthetic Gaussian data across
-several dimensions, writes
-`python/benchmarks/results/results_<timestamp>.csv`, and produces seaborn
-plots under `results/plots/`:
-
-- `threading_scaling.png` — M-to-N throughput vs `num_threads`, faceted by dim.
-- `sift_recall.png` — recall@{1,10,100} vs bits on SIFT1M.
-- `synthetic_throughput.png` — encode / 1-to-N / M-to-N vs dim.
-
-Useful flags: `--skip-sift`, `--skip-synthetic`, `--threads 1,4,8`,
-`--bits 4,8`, `--no-show` (for headless CI).
-
-Measured numbers from real hardware (Apple M3 and more as they come in)
-live in [`docs/benchmarks.md`](docs/benchmarks.md). Headline from M3,
-`dim=128, batch=10000, bits=8`: **~88M symmetric M-to-N ops/sec** and
-**~2.8M encode/sec** on a single laptop.
-
----
-
-## Layout and build
-
-```
-include/turboquant/
-  srht.h                 # shared SRHT: splitmix64 signs, Walsh–Hadamard, pow2 pad
-  turboquant.h           # TurboQuantCode layout
-  space_turboquant.h     # TurboQuantSpace + SIMD distance kernels
-  space_rabitq.h         # RaBitQSpace
-python/turboquant/
-  bindings.cpp           # pybind11 bindings
-  __init__.py
-python/tests/            # pytest suite
-python/benchmarks/       # run_benchmark.py (CSV + seaborn plots)
-CMakeLists.txt           # scikit-build-core entry point
-pyproject.toml
-```
-
-Header names are snake_case. The algorithm token matches the C++ namespace and the Python package (`turboquant`, `rabitq`). A space class lives in `space_<algorithm>.h`. The shared rotation is `srht.h`. `RaBitQSpace` is `rabitq::RaBitQSpace`; `turboquant::RaBitQSpace` is an alias of that class. Its kernels live in `rabitq::detail`, which is not nested in `turboquant`.
-
-The library is header-only in spirit — all algorithmic code is in
-`include/turboquant/`. Only the Python module (`bindings.cpp`) is compiled as
-a shared object. A C++ consumer can depend on the headers alone and call the
-same API directly.
-
-Build flags worth knowing:
-
-- `-DTURBOQUANT_HAVE_OPENMP` — set by CMake when OpenMP is detected; enables
-  all `#pragma omp` blocks. Absent → sequential fallback, same API.
-- Release build uses `-O3 -ffast-math -fno-finite-math-only`. The
-  `fno-finite-math-only` is intentional: it keeps `inf`/`nan` handling sane
-  while preserving vectorization.
-
-### Recall Benchmark
-![recall](python/benchmarks/results/plots/recall.png)
-
-### Tests
-
-```bash
-uv run pytest python/tests/ -v
-```
-
-Covers asymmetric/symmetric distances across `bits ∈ {4, 8}` and
-`dim ∈ {32..4096}`, batch variants, zero-copy torch interop, and padding
-correctness.
-
----
-
-## Roadmap
-
-The immediate priorities, in order:
-
-1. **Publish wheels to PyPI** (cibuildwheel workflow in place; awaiting first tagged release)
-
-Contributions welcome. The codebase is small (two headers, one bindings
-file, ~2k lines) and deliberately kept that way — if a change makes it
-harder to read, that is a reason to push back on it.
-
+Both scripts download datasets on first use (`run_benchmark.py`: into
+`python/benchmarks/data/`, override with `--data-dir`). The
+numbers in [`docs/benchmarks.md`](docs/benchmarks.md) were measured with
+code format of 0.1.x (no longer shipped) and have not been re-measured yet.
 
 ## Citation
 
-If you use this library in academic work, please cite the original TurboQuant
-paper (ICLR 2026) in addition to this repository.
+If you use this library in academic work, please cite the TurboQuant
+(ICLR 2026) and RaBitQ (SIGMOD 2024) papers in addition to this repository.

@@ -20,7 +20,9 @@
 #include <stdexcept>
 #include <vector>
 
-namespace turboquant {
+#include "config.h"
+
+namespace vsq::common {
 
 // splitmix64. The sequence is the sign source; do not change the constants.
 class RndGen64 {
@@ -42,8 +44,8 @@ inline void whtInplaceScalar(float *data, size_t const d) {
   for (size_t step = 1; step < d; step <<= 1) {
     const size_t jump = step << 1;
     for (size_t i = 0; i < d; i += jump) {
-      float *__restrict__ low = &data[i];
-      float *__restrict__ high = &data[i + step];
+      float *VSQ_RESTRICT low = &data[i];
+      float *VSQ_RESTRICT high = &data[i + step];
       for (size_t j = 0; j < step; ++j) {
         float a = low[j];
         float b = high[j];
@@ -82,7 +84,7 @@ inline std::vector<float> generateSigns(size_t const d, uint64_t const seed) {
 // Elementwise multiply by signs, then whtInplace.
 // data and signs each have length d.
 inline void randomizedHadamard(float *data,
-                               const float *const __restrict__ signs,
+                               const float *const VSQ_RESTRICT signs,
                                size_t const d) {
   if (data == nullptr || signs == nullptr)
     throw std::invalid_argument("randomizedHadamard: null pointer");
@@ -111,4 +113,4 @@ inline size_t roundUpPow2AtLeast4(size_t n) {
   return roundUpPow2(n < 4 ? 4 : n);
 }
 
-}  // namespace turboquant
+}  // namespace vsq::common

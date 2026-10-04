@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 
-from turboquant import TurboQuantSpace
+from vsq import TurboQuantSpace
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +278,9 @@ def _recall(pred: np.ndarray, gt: np.ndarray, k: int) -> float:
     return int((p == g).any(axis=2).sum()) / (pred.shape[0] * k)
 
 
+TRAIN_SAMPLE = 65536  # rows used to fit TurboQuant v2 centering
+
+
 def _time_min(fn, repeats: int = 5) -> float:
     best = float("inf")
     for _ in range(repeats):
@@ -297,7 +300,14 @@ def run_config(
     repeats: int, query_chunk: int, metric: str = "l2",
 ) -> dict:
     n_base, dim = base.shape
-    space = TurboQuantSpace(dim, bits_per_coord=bits, num_threads=num_threads)
+    space = TurboQuantSpace(dim, bits, num_threads=num_threads)
+    # Format v2 defaults to IVF centering: fit it once on a base sample
+    # (not part of the encode timing, like an index build step).
+    t_train = 0.0
+    if space.centering() != "none":
+        t0 = time.perf_counter()
+        space.train(np.ascontiguousarray(base[: min(len(base), TRAIN_SAMPLE)]))
+        t_train = time.perf_counter() - t0
 
     # warmup
     warm = space.encode_batch(base[:512])
@@ -322,6 +332,7 @@ def run_config(
         "dataset": dataset, "metric": metric,
         "n_base": n_base, "n_query": query.shape[0], "dim": dim, "bits": bits,
         "num_threads": space.num_threads(),
+        "train_ms": t_train * 1000,
         "encode_ms": t_enc * 1000,        "encode_vps": n_base / t_enc,
         "query_1ton_ms": t_1ton * 1000,   "query_1ton_vps": n_base / t_1ton,
         "query_mton_ms": t_mton * 1000,   "query_mton_vps": (n_query_mton * n_base) / t_mton,

@@ -46,6 +46,15 @@ jobs:
         run: |
           echo "OS=${{ matrix.os }} ARCH=${{ matrix.arch }} PY=${{ matrix.python-version }}"
           uv run python -c "import platform; print('machine:', platform.machine())"
+          uv run python -c "import vsq; print('dispatched kernels:', vsq.detected_isa())"
 
       - name: Run tests
         run: uv run pytest python/tests/ -v
+
+      - name: C++ core tests (copy safety, SIMD == scalar)
+        shell: bash
+        run: |
+          PY=$(uv run python -c "import sys; print(sys.executable)")
+          cmake -S . -B build-tests -DVSQ_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$PY"
+          cmake --build build-tests --target test_core --config Release
+          ctest --test-dir build-tests -C Release --output-on-failure

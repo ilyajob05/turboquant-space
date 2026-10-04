@@ -3,9 +3,9 @@ requires = ["scikit-build-core>=0.10", "pybind11>=2.13", "pybind11-stubgen"]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "turboquant-space"
-version = "0.1.0"
-description = "TurboQuant (ICLR 2026) — SIMD-accelerated 4/8-bit quantization Space for ANN"
+name = "vsq"
+version = "0.2.0"
+description = "Vector search quantization: TurboQuant and RaBitQ with SIMD kernels for ANN"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
@@ -18,7 +18,7 @@ Repository = "https://github.com/ilyajob05/turboquant-space"
 [tool.scikit-build]
 cmake.source-dir = "."
 cmake.args = ["-DCMAKE_BUILD_TYPE=Release"]
-wheel.packages = ["python/turboquant"]
+wheel.packages = ["python/vsq"]
 
 [tool.uv]
 dev-dependencies = [
