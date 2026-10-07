@@ -162,16 +162,56 @@ RaBitQSpace(dim, rot_seed=42, centroid=None, bits=1, encode_mode=None, *,
             rotation_rounds=3,
             query_bits=None,       # 1-bit: 4 (paper's B_q, popcount); 0 = float query
             num_threads=0, isa="auto")
+
+space = RaBitQSpace(768, bits=4)   # encode_mode=None -> windowed_scale
+space.train(X)                     # centroid = mean(X); recommended for real data
+codes = space.encode_batch(X)
 ```
 
-* `bits` ∈ {1, 4, 8}. 1-bit distances use the paper's quantized query:
-  `(B_q + 1) · D/64` popcounts per code instead of `D` float FMAs.
+* `bits` ∈ {1, 4, 8}. 1-bit distances use the paper's quantized query by
+  default: `(B_q + 1) · D/64` popcounts per code instead of `D` float FMAs;
+  `query_bits=0` scores against the float query (recall@10 +0.01–0.03).
+* `train(X)` — `(n, dim)` float32. Sets the centroid to the mean of `X` (in
+  every mode) and calibrates `trained_scale`. Codes encoded before `train`
+  used the old centroid and must be re-encoded. `trained()` and `centroid()`
+  read the state.
 * `distance_bound(q, code, eps0=1.9)` → `(estimate, lower, upper)` from the
   RaBitQ error bound (≈94% coverage at `eps0 = 1.9`).
-* `x == centroid` encodes to an exact `‖q − c‖²` (it used to raise).
-* `encode_mode` (4/8-bit): `fixed_scale` (default), `windowed_scale`,
-  `algorithm1` (bit-exact Extended RaBitQ; its sort is a 4-pass radix).
+* `x == centroid` encodes to an exact `‖q − c‖²`.
 * RaBitQ is asymmetric only — do not use it as the HNSW link metric.
+
+### Encode modes (4 and 8 bits)
+
+A 4/8-bit code stores each rotated residual coordinate `o'ᵢ` as a grid index
+`round(t · o'ᵢ)` clamped to `2^bits` levels. The **scale `t`** decides how
+the unit vector is stretched over the grid; the modes differ only in how `t`
+is chosen. They write the same slot and use the same distance kernel, so
+search speed and code size do not depend on the mode.
+
+| `encode_mode` | how `t` is chosen | needs `train` | encode cost | accuracy |
+|---|---|---|---|---|
+| `"windowed_scale"` **(default)** | per vector: the best `t` inside the RaBitQ tight interval, found with a min-heap of the next grid-step event per coordinate | no | medium | best, equal to `algorithm1` |
+| `"fixed_scale"` (static) | one `t` for the whole space: the mean Algorithm 1 optimum over 100 N(0, 1) vectors, computed in the constructor | no | lowest, O(1) per coordinate | 4 bits: equal; 8 bits: lower (recall@10 −0.015 on N(0, 1), dim 128) |
+| `"trained_scale"` (trained) | one `t` for the whole space: the mean Algorithm 1 optimum over up to 1024 residuals of *your* data, computed by `train(X)` | yes (`encode` raises before it) | lowest, as `fixed_scale` | as `fixed_scale` |
+| `"algorithm1"` (reference) | per vector: bit-exact Extended RaBitQ Algorithm 1, sorting every threshold | no | highest | best (the definition) |
+
+1-bit codes are signs and have no scale; `encode_mode` must be `None` or
+`"algorithm1"` there.
+
+**Which mode to use.** Keep the default unless encode throughput is the
+bottleneck (bulk index builds); then `fixed_scale` gives the same accuracy at
+4 bits and loses a little at 8 bits. `trained_scale` pins the static scale to
+your data, but it lands within ~1% of `fixed_scale`'s `t`: after the random
+rotation the coordinates of any unit residual are close to N(0, 1/D), so the
+best static scale hardly depends on the data. `algorithm1` is the reference
+for tests and papers.
+
+**What does depend on the data is the centroid.** Codes quantize `x − c`.
+Real embeddings are far from zero-mean, and the default zero centroid spends
+the grid on their common offset. Call `train(X)` (or pass `centroid=`) on
+real data: on dbpedia OpenAI embeddings (dim 1536) recall@10 rises from 0.938
+to 0.968 at 4 bits and from 0.66 to 0.82 at 1 bit. Measurements are in
+[`docs/benchmarks.md`](docs/benchmarks.md).
 
 ---
 
@@ -187,9 +227,37 @@ index = TurboQuantFastScan(space, codes)        # 4-bit TurboQuant, no qjl
 ids, dists = index.search(q, k=10, rerank=4)    # FastScan, then exact re-score
 
 rq = RaBitQSpace(768, bits=4)
+rq.train(X)                                     # centroid = mean(X)
 rindex = RaBitQFastScan(rq, X)                  # two-stage search from the paper
 ids, dists, n_refined = rindex.search(q, k=10)  # 1-bit estimate + bound, refine
 ```
+
+---
+
+## Autotune
+
+`vsq.autotune` chooses the quantizer, bit width, search path (flat or
+FastScan) and thread count for your data and an objective, measures every
+candidate on a sample of your data and builds the winner:
+
+```python
+result = vsq.autotune(X, profile="speed")   # "accuracy" | "speed" | "energy"
+ids, dists = result.index.search(q, k=10)
+print(result.report())                      # candidates, measurements, why
+```
+
+| profile | objective | default constraint |
+|---|---|---|
+| `accuracy` | highest recall@k | — |
+| `speed` | lowest single-query p50 latency at your n | recall@k ≥ 0.90 |
+| `energy` | lowest energy per query (proxy) | recall@k ≥ 0.90 |
+
+Optional limits: `min_recall`, `max_bytes_per_vector`, `max_latency_ms`,
+`time_budget_s`; the recall floor is checked against the lower 95 % bound of
+the measured recall. Data-independent rules narrow the catalog, cheap 4-bit
+candidates are calibrated first and 8/16-bit ones only if they miss the
+recall floor; `result.to_json()` stores the choice for reuse. Details:
+[`docs/autotune.md`](docs/autotune.md).
 
 ---
 
@@ -237,12 +305,20 @@ docker/test_amd64.sh                                             # x86-64: scala
 ```bash
 uv run python python/benchmarks/run_benchmark.py            # SIFT1M + synthetic sweep
 uv run python python/benchmarks/compare_quantizers.py       # TurboQuant vs RaBitQ
+uv run python python/benchmarks/plot_compare.py <compare_*.csv> --out-dir docs/img
 ```
 
-Both scripts download datasets on first use (`run_benchmark.py`: into
-`python/benchmarks/data/`, override with `--data-dir`). The
-numbers in [`docs/benchmarks.md`](docs/benchmarks.md) were measured with
-code format of 0.1.x (no longer shipped) and have not been re-measured yet.
+`run_benchmark.py` downloads SIFT1M and HF datasets on first use (into
+`python/benchmarks/data/`, override with `--data-dir`);
+`compare_quantizers.py` draws N(0, 1) data and takes real vectors with
+`--data X.npy`. The 0.2.0 numbers in [`docs/benchmarks.md`](docs/benchmarks.md)
+come from `compare_quantizers.py` (Apple M3, single thread, each quantizer at
+its most accurate default). On DBpedia OpenAI embeddings (dim 1536) recall@10
+is 0.974 (TurboQuant) vs 0.968 (RaBitQ) at 4 bits and 0.999 for both at 8
+bits. `TurboQuantFastScan` is the fastest flat scan (27–209 M codes/s, no
+recall loss); RaBitQ's per-pair scan is ~2× TurboQuant's.
+
+![recall@10 and relative distance error against bytes per code](docs/img/compare_accuracy.png)
 
 ## Citation
 
