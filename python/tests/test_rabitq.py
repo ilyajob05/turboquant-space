@@ -444,7 +444,7 @@ def test_extended_distance_matches_oracle(dim, bits):
     seed = 42
     rng = np.random.default_rng(3000 + dim * 10 + bits)
     centroid = rng.standard_normal(dim).astype(np.float32) * np.float32(0.1)
-    # Default 4/8-bit encode is fixed_scale. The oracle reads the stored
+    # Default 4/8-bit encode is windowed_scale. The oracle reads the stored
     # grid, so this checks the distance of that code, not Algorithm 1 bytes.
     space = RaBitQSpace(dim, rot_seed=seed, centroid=centroid, bits=bits)
     # D < 16 stays on the scalar tail for 4-bit NEON. Wider D exercises vmla.
@@ -475,23 +475,28 @@ def _rotated_unit(vec, seed, centroid):
     return rot, norm
 
 
-@pytest.mark.parametrize("mode", ["fixed_scale", "windowed_scale"])
+_MODE_SEED = {"fixed_scale": 0, "windowed_scale": 1, "trained_scale": 2}
+
+
+@pytest.mark.parametrize("mode", ["fixed_scale", "windowed_scale", "trained_scale"])
 @pytest.mark.parametrize("bits", [4, 8])
 @pytest.mark.parametrize("dim", [8, 32])
 def test_fast_encode_matches_grid_dot(mode, bits, dim):
     seed = 42
-    rng = np.random.default_rng(
-        4000 + dim * 10 + bits + (0 if mode == "fixed_scale" else 1)
-    )
+    rng = np.random.default_rng(4000 + dim * 10 + bits + _MODE_SEED[mode])
     centroid = rng.standard_normal(dim).astype(np.float32) * np.float32(0.1)
     space = RaBitQSpace(
         dim, rot_seed=seed, centroid=centroid, bits=bits, encode_mode=mode
     )
     assert space.encode_mode() == mode
-    if mode == "fixed_scale":
-        assert space.fixed_scale() > 0.0
-    else:
+    if mode == "trained_scale":
+        # train() moves the centroid to the data mean; the oracle follows it.
+        space.train((rng.standard_normal((256, dim)) + 0.3).astype(np.float32))
+        centroid = np.asarray(space.centroid(), dtype=np.float32)
+    if mode == "windowed_scale":
         assert space.fixed_scale() == 0.0
+    else:
+        assert space.fixed_scale() > 0.0
     center = np.float32(7.5 if bits == 4 else 127.5)
     D = int(space.padded_dim())
     for _ in range(3):
@@ -517,7 +522,7 @@ def test_fast_encode_matches_grid_dot(mode, bits, dim):
 
 
 def test_default_encode_mode_follows_bits():
-    """Omitted encode_mode is algorithm1 at 1 bit and fixed_scale at 4/8."""
+    """Omitted encode_mode is algorithm1 at 1 bit and windowed_scale at 4/8."""
     rng = np.random.default_rng(7)
     x = rng.standard_normal(16).astype(np.float32)
     one = RaBitQSpace(16, rot_seed=42)
@@ -527,15 +532,14 @@ def test_default_encode_mode_follows_bits():
     assert explicit_one.encode_mode() == "algorithm1"
     np.testing.assert_array_equal(one.encode(x), explicit_one.encode(x))
     default4 = RaBitQSpace(16, rot_seed=42, bits=4)
-    named4 = RaBitQSpace(16, rot_seed=42, bits=4, encode_mode="fixed_scale")
-    assert default4.encode_mode() == "fixed_scale"
-    assert default4.fixed_scale() > 0.0
-    np.testing.assert_allclose(default4.fixed_scale(), named4.fixed_scale())
+    named4 = RaBitQSpace(16, rot_seed=42, bits=4, encode_mode="windowed_scale")
+    assert default4.encode_mode() == "windowed_scale"
+    assert default4.fixed_scale() == 0.0
     np.testing.assert_array_equal(default4.encode(x), named4.encode(x))
     sweep = RaBitQSpace(16, rot_seed=42, bits=4, encode_mode="algorithm1")
     assert sweep.encode_mode() == "algorithm1"
     assert sweep.fixed_scale() == 0.0
-    assert RaBitQSpace(16, bits=8).encode_mode() == "fixed_scale"
+    assert RaBitQSpace(16, bits=8).encode_mode() == "windowed_scale"
 
 
 def test_encode_mode_rejects_unknown_and_1bit():
@@ -549,6 +553,62 @@ def test_encode_mode_rejects_unknown_and_1bit():
         RaBitQSpace(16, bits=1, encode_mode="fixed_scale")
     with pytest.raises(ValueError):
         RaBitQSpace(16, bits=1, encode_mode="windowed_scale")
+    with pytest.raises(ValueError):
+        RaBitQSpace(16, bits=1, encode_mode="trained_scale")
+
+
+@pytest.mark.parametrize("bits,mode", [(1, None), (4, "fixed_scale"), (4, "windowed_scale"),
+                                       (8, "trained_scale"), (4, "algorithm1")])
+def test_train_sets_mean_centroid(bits, mode):
+    dim = 24
+    rng = np.random.default_rng(11)
+    X = (rng.standard_normal((300, dim)) + 2.0).astype(np.float32)
+    space = RaBitQSpace(dim, bits=bits, encode_mode=mode)
+    assert not space.trained()
+    np.testing.assert_array_equal(space.centroid(), np.zeros(dim, np.float32))
+    space.train(X)
+    assert space.trained()
+    np.testing.assert_allclose(space.centroid(), X.mean(axis=0), rtol=1e-5, atol=1e-5)
+    # A vector equal to the centroid encodes exactly: distance is ||q - c||^2.
+    q = rng.standard_normal(dim).astype(np.float32)
+    c = np.asarray(space.centroid(), dtype=np.float32)
+    got = space.distance(q, space.encode(c))
+    np.testing.assert_allclose(got, float(((q - c) ** 2).sum()), rtol=1e-4)
+
+
+def test_trained_scale_requires_train():
+    space = RaBitQSpace(32, bits=4, encode_mode="trained_scale")
+    assert space.fixed_scale() == 0.0
+    x = np.ones((2, 32), np.float32)
+    with pytest.raises(RuntimeError, match="train"):
+        space.encode(x[0])
+    with pytest.raises(RuntimeError, match="train"):
+        space.encode_batch(x)
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_trained_scale_matches_fixed_scale_on_gaussian(bits):
+    """On isotropic data the data-calibrated t equals the N(0,1) one (±5%)."""
+    dim = 128
+    X = np.random.default_rng(3).standard_normal((2048, dim)).astype(np.float32)
+    trained = RaBitQSpace(dim, bits=bits, encode_mode="trained_scale")
+    trained.train(X)
+    fixed = RaBitQSpace(dim, bits=bits, encode_mode="fixed_scale")
+    assert trained.fixed_scale() > 0.0
+    np.testing.assert_allclose(trained.fixed_scale(), fixed.fixed_scale(), rtol=0.05)
+
+
+def test_train_rejects_bad_input():
+    space = RaBitQSpace(16, bits=4)
+    with pytest.raises(ValueError):
+        space.train(np.ones((4, 15), np.float32))  # wrong dim
+    with pytest.raises(ValueError):
+        space.train(np.ones((4, 16), np.float64))  # wrong dtype
+    bad = np.ones((4, 16), np.float32)
+    bad[1, 3] = np.nan
+    with pytest.raises(ValueError):
+        space.train(bad)
+    assert not space.trained()
 
 
 def test_fixed_scale_encode_is_reentrant():

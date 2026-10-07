@@ -361,16 +361,18 @@ void bindRaBitQ(py::module_ &m) {
                         py::object encode_mode, const std::string &rotation, int rotation_rounds,
                         py::object query_bits, int num_threads, const std::string &isa) {
                 // None is the C++ sentinel -1: 1-bit -> algorithm1,
-                // 4/8-bit -> fixed_scale. A string selects the mode.
+                // 4/8-bit -> RaBitQSpace::kDefaultEncodeMode. A string selects the mode.
                 int mode = -1;
                 if (!encode_mode.is_none()) {
                     const std::string name = py::cast<std::string>(encode_mode);
-                    if (name == "algorithm1") mode = 0;
-                    else if (name == "fixed_scale") mode = 1;
-                    else if (name == "windowed_scale") mode = 2;
+                    if (name == "algorithm1") mode = RaBitQSpace::Algorithm1;
+                    else if (name == "fixed_scale") mode = RaBitQSpace::FixedScale;
+                    else if (name == "windowed_scale") mode = RaBitQSpace::WindowedScale;
+                    else if (name == "trained_scale") mode = RaBitQSpace::TrainedScale;
                     else
                         throw py::value_error(
-                            "encode_mode must be algorithm1, fixed_scale, or windowed_scale");
+                            "encode_mode must be algorithm1, fixed_scale, windowed_scale, "
+                            "or trained_scale");
                 }
                 const int qbits = query_bits.is_none() ? -1 : py::cast<int>(query_bits);
                 const float *cp = nullptr;
@@ -385,6 +387,24 @@ void bindRaBitQ(py::module_ &m) {
             py::arg("query_bits") = py::none(), py::arg("num_threads") = 0, py::arg("isa") = "auto")
         .def("encode_mode", &RaBitQSpace::encodeModeName)
         .def("fixed_scale", &RaBitQSpace::fixedScale)
+        .def(
+            "train",
+            [](RaBitQSpace &self, py::buffer X) {
+                const FloatArray a = requireFloat(X, self.dim(), "X", 2);
+                py::gil_scoped_release nogil;
+                self.train(a.ptr, a.rows);
+            },
+            py::arg("X"),
+            "Fit to X [n, dim] float32: centroid = mean(X); trained_scale also "
+            "calibrates its scale on the residuals. Re-encode codes written before.")
+        .def("trained", &RaBitQSpace::trained)
+        .def("centroid",
+             [](const RaBitQSpace &self) {
+                 const auto &c = self.centroid();
+                 py::array_t<float> out(static_cast<ssize_t>(c.size()));
+                 std::copy(c.begin(), c.end(), out.mutable_data());
+                 return out;
+             })
         .def("dim", &RaBitQSpace::dim)
         .def("padded_dim", &RaBitQSpace::paddedDim)
         .def("bits", &RaBitQSpace::bits)

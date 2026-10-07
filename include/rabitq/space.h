@@ -44,18 +44,33 @@
 // distanceBound() turns it into [lower, upper] for the squared distance
 // (eps0 = 1.9 by default; quantized-query error is not included).
 //
-// 4/8-bit encode_mode. The constructor default is -1, resolved from bits:
-// 1-bit stays algorithm1; 4-bit and 8-bit use fixed_scale.
-//   0 algorithm1      sort every threshold. Bit-exact Extended RaBitQ
-//                     Algorithm 1.
-//   1 fixed_scale     one scale t frozen for the whole space, then O(1)
-//                     per coordinate. t is the mean Algorithm 1 plateau
-//                     edge over 100 N(0,1) residuals at seed 42 (not
-//                     rot_seed). This is the 4/8-bit default.
-//   2 windowed_scale  one scale per vector, inside the RaBitQ-Library
-//                     tight interval, chosen by a min-heap of the next
-//                     magnitude event.
-// fixed_scale and windowed_scale require bits 4 or 8.
+// 4/8-bit encode_mode: how the grid scale t (codes = round(t * o') clamped
+// to the grid) is chosen. All modes write the same slot and use the same
+// distance kernel; they differ only in encode cost and code quality. The
+// constructor default is -1, resolved from bits: 1-bit is algorithm1 (the
+// sign code has no scale); 4-bit and 8-bit use kDefaultEncodeMode =
+// windowed_scale, the most accurate mode per unit of encode cost.
+//   0 algorithm1      per vector, sort every threshold. Bit-exact Extended
+//                     RaBitQ Algorithm 1; O(D log D). Reference accuracy.
+//   1 fixed_scale     static: one t frozen for the whole space, O(1) per
+//                     coordinate. t is the mean Algorithm 1 plateau edge
+//                     over 100 N(0,1) residuals at seed 42 (not rot_seed).
+//                     Fastest encode; at 8 bits recall is lower.
+//   2 windowed_scale  per vector, inside the RaBitQ-Library tight interval,
+//                     chosen by a min-heap of the next magnitude event.
+//                     Same accuracy as algorithm1, several times faster.
+//                     The 4/8-bit default.
+//   3 trained_scale   like fixed_scale, but t is calibrated by train(X) on
+//                     the residuals x - c of the data itself. encode before
+//                     train() throws. After the random rotation residual
+//                     coordinates are near N(0, 1/D) for any data, so t (and
+//                     accuracy) is within ~1% of fixed_scale.
+// fixed_scale, windowed_scale and trained_scale require bits 4 or 8.
+//
+// Centroid. Codes quantize the residual x - c. c is the constructor
+// argument (zero by default) or, after train(X), the mean of X, in every
+// mode. On real embeddings, which are far from zero-mean, centering is the
+// largest accuracy factor (recall@10 0.94 -> 0.97 at 4 bits on dbpedia).
 
 #include <algorithm>
 #include <atomic>
@@ -89,8 +104,17 @@ public:
     using DistFunc = float (*)(const void *, const void *, const void *);
     static constexpr float kDefaultEps0 = 1.9f;  // RaBitQ confidence constant
 
-    // centroid == nullptr means the zero vector of length `dim` (copied).
-    // encode_mode -1/0/1/2: default, algorithm1, fixed_scale, windowed_scale.
+    // Encode modes (see the file header). -1 resolves from bits: 1-bit ->
+    // Algorithm1, 4/8-bit -> kDefaultEncodeMode.
+    enum EncodeMode : int { Algorithm1 = 0, FixedScale = 1, WindowedScale = 2, TrainedScale = 3 };
+    static constexpr int kDefaultEncodeMode = WindowedScale;
+    // Rows of X used by train() to calibrate trained_scale (even stride).
+    static constexpr size_t kTrainCalibRows = 1024;
+
+    // centroid == nullptr means the zero vector of length `dim` (copied);
+    // train(X) replaces it with the mean of X.
+    // encode_mode -1/0/1/2/3: default, algorithm1, fixed_scale,
+    // windowed_scale, trained_scale (needs train() before encode).
     // query_bits -1: default (1-bit: 4, the paper's B_q; 4/8-bit: 0 = float
     // query). 1-bit accepts 0..8; 4/8-bit accept 0 only.
     RaBitQSpace(size_t dim, uint64_t rot_seed, const float *centroid, int bits = 1,
@@ -111,22 +135,49 @@ public:
           num_threads_(common::resolveNumThreads(num_threads)) {
         if (bits_ != 1 && bits_ != 4 && bits_ != 8)
             throw std::invalid_argument("RaBitQ: bits must be 1, 4, or 8");
-        if (encode_mode_ < -1 || encode_mode_ > 2)
+        if (encode_mode_ < -1 || encode_mode_ > TrainedScale)
             throw std::invalid_argument(
-                "RaBitQ: encode_mode must be -1, 0, 1, or 2");
+                "RaBitQ: encode_mode must be -1, 0, 1, 2, or 3");
         if (encode_mode_ < 0)
-            encode_mode_ = bits_ == 1 ? 0 : 1;
-        if (encode_mode_ != 0 && bits_ == 1)
+            encode_mode_ = bits_ == 1 ? Algorithm1 : kDefaultEncodeMode;
+        if (encode_mode_ != Algorithm1 && bits_ == 1)
             throw std::invalid_argument(
-                "RaBitQ: fixed_scale and windowed_scale require bits 4 or 8");
+                "RaBitQ: fixed_scale, windowed_scale and trained_scale require bits 4 or 8");
         query_bits_ = resolveQueryBits(query_bits);
         if (centroid != nullptr)
             std::copy(centroid, centroid + dim_, centroid_.begin());
         dist_func_ = selectDist();
         bitwise_ = bitwise::selectBitwise(isa_);
-        if (encode_mode_ == 1)
+        if (encode_mode_ == FixedScale)
             t_fixed_ = calibrateFixedScale();
     }
+
+    // Fits the space to data. X: row-major float32 [n, dim], n >= 1, finite.
+    // Sets the centroid to the mean of X (every mode), and for trained_scale
+    // calibrates the frozen scale on the residuals x - c of up to
+    // kTrainCalibRows rows. Not thread-safe against concurrent encode/search;
+    // codes written before train() use the old centroid and must be re-encoded.
+    void train(const float *X, size_t n) {
+        if (X == nullptr || n == 0)
+            throw std::invalid_argument("RaBitQ train: empty data");
+        std::vector<double> acc(dim_, 0.0);
+        for (size_t r = 0; r < n; ++r) {
+            const float *x = X + r * dim_;
+            for (size_t i = 0; i < dim_; ++i) acc[i] += x[i];
+        }
+        std::vector<float> mean(dim_);
+        for (size_t i = 0; i < dim_; ++i) {
+            mean[i] = static_cast<float>(acc[i] / static_cast<double>(n));
+            if (!std::isfinite(mean[i]))
+                throw std::invalid_argument("RaBitQ train: input is not finite");
+        }
+        centroid_ = std::move(mean);
+        if (encode_mode_ == TrainedScale)
+            t_fixed_ = calibrateTrainedScale(X, n);
+        trained_ = true;
+    }
+    // True once train() has run.
+    bool trained() const { return trained_; }
 
     size_t dim() const { return dim_; }
     size_t paddedDim() const { return padded_; }
@@ -137,15 +188,17 @@ public:
     int rotationRounds() const { return rot_.rounds(); }
     common::RotationKind rotationKind() const { return rot_.kind(); }
     const std::vector<float> &centroid() const { return centroid_; }
-    // "algorithm1", "fixed_scale", or "windowed_scale".
+    // "algorithm1", "fixed_scale", "windowed_scale", or "trained_scale".
     const char *encodeModeName() const {
-        if (encode_mode_ == 1)
-            return "fixed_scale";
-        if (encode_mode_ == 2)
-            return "windowed_scale";
-        return "algorithm1";
+        switch (encode_mode_) {
+            case FixedScale: return "fixed_scale";
+            case WindowedScale: return "windowed_scale";
+            case TrainedScale: return "trained_scale";
+            default: return "algorithm1";
+        }
     }
-    // Frozen scale of fixed_scale. 0 for algorithm1 and windowed_scale.
+    // Frozen scale of fixed_scale / trained_scale (0 before train() for the
+    // latter). 0 for algorithm1 and windowed_scale.
     double fixedScale() const { return t_fixed_; }
 
     // Bytes of one data slot.
@@ -168,6 +221,8 @@ public:
     void encode(const float *x, void *slot) const {
         if (x == nullptr || slot == nullptr)
             throw std::invalid_argument("RaBitQ encode: null pointer");
+        if (encode_mode_ == TrainedScale && !trained_)
+            throw std::runtime_error("RaBitQ encode: trained_scale needs train(X) first");
         float *rotated = scratch();
         float norm = 0.0f;
         for (size_t i = 0; i < dim_; ++i) {
@@ -206,9 +261,9 @@ public:
         static thread_local std::vector<uint8_t> codes;
         if (codes.size() < padded_) codes.resize(padded_);
         float dot = 0.0f;
-        if (encode_mode_ == 1)
+        if (encode_mode_ == FixedScale || encode_mode_ == TrainedScale)
             dot = quantizeFixedScale(rotated, codes.data());
-        else if (encode_mode_ == 2)
+        else if (encode_mode_ == WindowedScale)
             dot = quantizeWindowedScale(rotated, codes.data());
         else
             dot = quantizeExtended(rotated, codes.data());
@@ -708,27 +763,24 @@ private:
             std::to_string(padded_));
     }
 
-    // Mean Algorithm 1 scale on 100 standard-normal residuals. Seed 42 is
-    // the library's calibration seed and does not depend on rot_seed.
-    // The residual is padded, normalized, and rotated the same way encode is.
-    double calibrateFixedScale() const {
-        constexpr int kCount = 100;
-        std::mt19937_64 rng(42);
-        std::normal_distribution<float> normal(0.0f, 1.0f);
+    // Mean Algorithm 1 plateau edge over `count` residuals. fill(n, r) writes
+    // residual n into r[0, dim) (r[dim, D) is already zero); each one is
+    // normalized and rotated the same way encode is. Zero or degenerate
+    // residuals are skipped. Throws if none is usable or t is not positive.
+    template <class Fill>
+    double meanPlateauScale(size_t count, Fill fill, const char *what) const {
         std::vector<float> rotated(padded_, 0.0f);
         std::vector<uint8_t> codes(padded_);
         double sum = 0.0;
-        int used = 0;
-        for (int n = 0; n < kCount; ++n) {
+        size_t used = 0;
+        for (size_t n = 0; n < count; ++n) {
             std::fill(rotated.begin(), rotated.end(), 0.0f);
+            fill(n, rotated.data());
             float norm = 0.0f;
-            for (size_t i = 0; i < dim_; ++i) {
-                const float v = normal(rng);
-                rotated[i] = v;
-                norm += v * v;
-            }
+            for (size_t i = 0; i < dim_; ++i)
+                norm += rotated[i] * rotated[i];
             norm = std::sqrt(norm);
-            if (!(norm > 0.0f))
+            if (!(norm > 0.0f) || !std::isfinite(norm))
                 continue;
             const float inv = 1.0f / norm;
             for (size_t i = 0; i < dim_; ++i)
@@ -743,15 +795,43 @@ private:
             ++used;
         }
         if (used == 0)
-            throw std::invalid_argument(
-                "RaBitQ fixed scale: calibration produced no vector, padded_dim=" +
-                std::to_string(padded_));
+            throw std::invalid_argument(std::string("RaBitQ ") + what +
+                                        ": calibration produced no vector, padded_dim=" +
+                                        std::to_string(padded_));
         const double t = sum / static_cast<double>(used);
         if (!(t > 0.0) || !std::isfinite(t))
-            throw std::invalid_argument(
-                "RaBitQ fixed scale: t_fixed is not positive, padded_dim=" +
-                std::to_string(padded_));
+            throw std::invalid_argument(std::string("RaBitQ ") + what +
+                                        ": scale is not positive, padded_dim=" +
+                                        std::to_string(padded_));
         return t;
+    }
+
+    // fixed_scale: mean plateau edge over 100 standard-normal residuals. Seed
+    // 42 is the library's calibration seed and does not depend on rot_seed.
+    double calibrateFixedScale() const {
+        constexpr size_t kCount = 100;
+        std::mt19937_64 rng(42);
+        std::normal_distribution<float> normal(0.0f, 1.0f);
+        return meanPlateauScale(
+            kCount,
+            [&](size_t, float *r) {
+                for (size_t i = 0; i < dim_; ++i) r[i] = normal(rng);
+            },
+            "fixed scale");
+    }
+
+    // trained_scale: mean plateau edge over the residuals x - c of up to
+    // kTrainCalibRows rows of X [n, dim], taken at an even stride.
+    double calibrateTrainedScale(const float *X, size_t n) const {
+        const size_t count = std::min(n, kTrainCalibRows);
+        const size_t stride = n / count;  // >= 1 because count <= n
+        return meanPlateauScale(
+            count,
+            [&](size_t k, float *r) {
+                const float *x = X + k * stride * dim_;
+                for (size_t i = 0; i < dim_; ++i) r[i] = x[i] - centroid_[i];
+            },
+            "trained scale");
     }
 
     // windowed_scale: min-heap of the next magnitude step inside [t_start, t_end).
@@ -940,7 +1020,8 @@ private:
     float inv_sqrt_d_;
     float center_;
     int encode_mode_;
-    double t_fixed_;
+    double t_fixed_;  // frozen scale of fixed_scale / trained_scale
+    bool trained_ = false;
     common::Isa isa_;
     int num_threads_;
     int query_bits_ = 0;
