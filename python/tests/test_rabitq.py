@@ -123,8 +123,8 @@ def oracle_distance(query, slot, seed, centroid):
 
 
 def test_slot_size_and_padding():
-    space6 = RaBitQSpace(6, rot_seed=7)
-    space8 = RaBitQSpace(8, rot_seed=7)
+    space6 = RaBitQSpace(6, rot_seed=7, bits=1)
+    space8 = RaBitQSpace(8, rot_seed=7, bits=1)
     assert space6.padded_dim() == 8
     assert space8.padded_dim() == 8
     assert space6.code_size_bytes() == (8 + 7) // 8 + 8
@@ -137,7 +137,7 @@ def test_encode_bits_match_oracle(dim):
     rng = np.random.default_rng(dim)
     centroid = rng.standard_normal(dim).astype(np.float32)
     x = rng.standard_normal(dim).astype(np.float32)
-    space = RaBitQSpace(dim, rot_seed=seed, centroid=centroid)
+    space = RaBitQSpace(dim, rot_seed=seed, centroid=centroid, bits=1)
     got = np.asarray(space.encode(x), dtype=np.uint8)
     expect = np.asarray(oracle_encode(x, seed, centroid), dtype=np.uint8)
     # Sign bits are bit-exact. The two float32 tails (norm, dot_factor) may
@@ -154,7 +154,7 @@ def test_distance_matches_oracle(dim):
     seed = 42
     rng = np.random.default_rng(1000 + dim)
     centroid = rng.standard_normal(dim).astype(np.float32) * np.float32(0.1)
-    space = RaBitQSpace(dim, rot_seed=seed, centroid=centroid)
+    space = RaBitQSpace(dim, rot_seed=seed, centroid=centroid, bits=1)
     for k in range(32):
         x = rng.standard_normal(dim).astype(np.float32)
         q = rng.standard_normal(dim).astype(np.float32)
@@ -253,7 +253,7 @@ def test_distance_kernel_matches_this_machine():
 
 
 def test_wrong_code_size_is_rejected():
-    space = RaBitQSpace(16, rot_seed=1)
+    space = RaBitQSpace(16, rot_seed=1, bits=1)
     q = np.ones(16, np.float32)
     bad = np.zeros(4, np.uint8)
     with pytest.raises(Exception) as exc:
@@ -266,7 +266,7 @@ def test_zero_residual_encodes_to_centroid_distance():
     # estimate is exactly ||q - c||^2.
     dim = 8
     c = np.arange(dim, dtype=np.float32)
-    space = RaBitQSpace(dim, rot_seed=3, centroid=c)
+    space = RaBitQSpace(dim, rot_seed=3, centroid=c, bits=1)
     code = space.encode(c.copy())
     q = np.linspace(-1.0, 2.0, dim).astype(np.float32)
     np.testing.assert_allclose(space.distance(q, code), float(np.sum((q - c) ** 2)), rtol=1e-5)
@@ -276,7 +276,7 @@ def test_query_at_centroid_is_squared_norm():
     dim = 8
     seed = 9
     c = np.zeros(dim, np.float32)
-    space = RaBitQSpace(dim, rot_seed=seed, centroid=c)
+    space = RaBitQSpace(dim, rot_seed=seed, centroid=c, bits=1)
     x = np.arange(1, dim + 1, dtype=np.float32)
     code = space.encode(x)
     got = space.distance(c, code)
@@ -409,11 +409,12 @@ def test_invalid_bits_rejected():
     assert "bits" in str(exc.value).lower()
 
 
-def test_explicit_one_bit_matches_default():
+def test_explicit_four_bit_matches_default():
     rng = np.random.default_rng(5)
     x = rng.standard_normal(16).astype(np.float32)
     default = RaBitQSpace(16, rot_seed=42)
-    explicit = RaBitQSpace(16, rot_seed=42, bits=1)
+    explicit = RaBitQSpace(16, rot_seed=42, bits=4)
+    assert default.bits() == 4
     np.testing.assert_array_equal(default.encode(x), explicit.encode(x))
 
 
@@ -522,20 +523,20 @@ def test_fast_encode_matches_grid_dot(mode, bits, dim):
 
 
 def test_default_encode_mode_follows_bits():
-    """Omitted encode_mode is algorithm1 at 1 bit and windowed_scale at 4/8."""
+    """Omitted encode_mode: algorithm1 at 1 bit, fixed_scale at 4, windowed_scale at 8."""
     rng = np.random.default_rng(7)
     x = rng.standard_normal(16).astype(np.float32)
-    one = RaBitQSpace(16, rot_seed=42)
+    one = RaBitQSpace(16, rot_seed=42, bits=1)
     assert one.encode_mode() == "algorithm1"
     assert one.fixed_scale() == 0.0
-    explicit_one = RaBitQSpace(16, rot_seed=42, bits=1)
-    assert explicit_one.encode_mode() == "algorithm1"
-    np.testing.assert_array_equal(one.encode(x), explicit_one.encode(x))
     default4 = RaBitQSpace(16, rot_seed=42, bits=4)
-    named4 = RaBitQSpace(16, rot_seed=42, bits=4, encode_mode="windowed_scale")
-    assert default4.encode_mode() == "windowed_scale"
-    assert default4.fixed_scale() == 0.0
+    named4 = RaBitQSpace(16, rot_seed=42, bits=4, encode_mode="fixed_scale")
+    assert default4.encode_mode() == "fixed_scale"
+    assert default4.fixed_scale() > 0.0
     np.testing.assert_array_equal(default4.encode(x), named4.encode(x))
+    default8 = RaBitQSpace(16, rot_seed=42, bits=8)
+    named8 = RaBitQSpace(16, rot_seed=42, bits=8, encode_mode="windowed_scale")
+    np.testing.assert_array_equal(default8.encode(x), named8.encode(x))
     sweep = RaBitQSpace(16, rot_seed=42, bits=4, encode_mode="algorithm1")
     assert sweep.encode_mode() == "algorithm1"
     assert sweep.fixed_scale() == 0.0

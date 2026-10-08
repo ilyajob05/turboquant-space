@@ -26,7 +26,7 @@ class RaBitQFastScan:
         (ids, dists, n_refined): two-stage search; n_refined codes used the full code.
         """
 class RaBitQSpace:
-    def __init__(self, dim: typing.SupportsInt | typing.SupportsIndex, rot_seed: typing.SupportsInt | typing.SupportsIndex = 42, centroid: typing.Any = None, bits: typing.SupportsInt | typing.SupportsIndex = 1, encode_mode: typing.Any = None, *, rotation: str = 'kac', rotation_rounds: typing.SupportsInt | typing.SupportsIndex = 3, query_bits: typing.Any = None, num_threads: typing.SupportsInt | typing.SupportsIndex = 0, isa: str = 'auto') -> None:
+    def __init__(self, dim: typing.SupportsInt | typing.SupportsIndex, rot_seed: typing.SupportsInt | typing.SupportsIndex = 42, centroid: typing.Any = None, bits: typing.SupportsInt | typing.SupportsIndex = 4, encode_mode: typing.Any = None, *, rotation: str = 'kac', rotation_rounds: typing.SupportsInt | typing.SupportsIndex = 3, query_bits: typing.Any = None, num_threads: typing.SupportsInt | typing.SupportsIndex = 0, isa: str = 'auto') -> None:
         ...
     def bits(self) -> int:
         ...

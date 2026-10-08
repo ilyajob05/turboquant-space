@@ -157,18 +157,18 @@ pass). Bring your own centroids (e.g. from FAISS) with `set_centroids`.
 ## RaBitQSpace
 
 ```python
-RaBitQSpace(dim, rot_seed=42, centroid=None, bits=1, encode_mode=None, *,
+RaBitQSpace(dim, rot_seed=42, centroid=None, bits=4, encode_mode=None, *,
             rotation="kac",        # "kac" (default) | "legacy" (0.1.x codes)
             rotation_rounds=3,
             query_bits=None,       # 1-bit: 4 (paper's B_q, popcount); 0 = float query
             num_threads=0, isa="auto")
 
-space = RaBitQSpace(768, bits=4)   # encode_mode=None -> windowed_scale
+space = RaBitQSpace(768)           # bits=4, encode_mode=None -> fixed_scale
 space.train(X)                     # centroid = mean(X); recommended for real data
 codes = space.encode_batch(X)
 ```
 
-* `bits` ∈ {1, 4, 8}. 1-bit distances use the paper's quantized query by
+* `bits` ∈ {1, 4, 8}, default 4. 1-bit distances use the paper's quantized query by
   default: `(B_q + 1) · D/64` popcounts per code instead of `D` float FMAs;
   `query_bits=0` scores against the float query (recall@10 +0.01–0.03).
 * `train(X)` — `(n, dim)` float32. Sets the centroid to the mean of `X` (in
@@ -190,17 +190,19 @@ search speed and code size do not depend on the mode.
 
 | `encode_mode` | how `t` is chosen | needs `train` | encode cost | accuracy |
 |---|---|---|---|---|
-| `"windowed_scale"` **(default)** | per vector: the best `t` inside the RaBitQ tight interval, found with a min-heap of the next grid-step event per coordinate | no | medium | best, equal to `algorithm1` |
-| `"fixed_scale"` (static) | one `t` for the whole space: the mean Algorithm 1 optimum over 100 N(0, 1) vectors, computed in the constructor | no | lowest, O(1) per coordinate | 4 bits: equal; 8 bits: lower (recall@10 −0.015 on N(0, 1), dim 128) |
+| `"windowed_scale"` (**8-bit default**) | per vector: the best `t` inside the RaBitQ tight interval, found with a min-heap of the next grid-step event per coordinate | no | medium | best, equal to `algorithm1` |
+| `"fixed_scale"` (static, **4-bit default**) | one `t` for the whole space: the mean Algorithm 1 optimum over 100 N(0, 1) vectors, computed in the constructor | no | lowest, O(1) per coordinate | 4 bits: equal; 8 bits: lower (recall@10 −0.015 on N(0, 1), dim 128) |
 | `"trained_scale"` (trained) | one `t` for the whole space: the mean Algorithm 1 optimum over up to 1024 residuals of *your* data, computed by `train(X)` | yes (`encode` raises before it) | lowest, as `fixed_scale` | as `fixed_scale` |
 | `"algorithm1"` (reference) | per vector: bit-exact Extended RaBitQ Algorithm 1, sorting every threshold | no | highest | best (the definition) |
 
 1-bit codes are signs and have no scale; `encode_mode` must be `None` or
 `"algorithm1"` there.
 
-**Which mode to use.** Keep the default unless encode throughput is the
-bottleneck (bulk index builds); then `fixed_scale` gives the same accuracy at
-4 bits and loses a little at 8 bits. `trained_scale` pins the static scale to
+**Which mode to use.** Keep the default (`encode_mode=None`): at 4 bits
+`fixed_scale` matches `windowed_scale` within measurement noise and encodes
+9–11× faster; at 8 bits `windowed_scale` is more accurate (recall@10
++0.001…+0.016), so it is the default there. Pin `fixed_scale` at 8 bits only
+when encode throughput is the bottleneck. `trained_scale` pins the static scale to
 your data, but it lands within ~1% of `fixed_scale`'s `t`: after the random
 rotation the coordinates of any unit residual are close to N(0, 1/D), so the
 best static scale hardly depends on the data. `algorithm1` is the reference
@@ -258,6 +260,28 @@ the measured recall. Data-independent rules narrow the catalog, cheap 4-bit
 candidates are calibrated first and 8/16-bit ones only if they miss the
 recall floor; `result.to_json()` stores the choice for reuse. Details:
 [`docs/autotune.md`](docs/autotune.md).
+
+### Presets (no calibration)
+
+When you know the trade-off you want, or have fewer than ~1000 vectors,
+build a named preset directly:
+
+```python
+index = vsq.build_index(X)                  # preset "balanced"
+index = vsq.build_index(X, "compact")       # or "accurate", or a QuantizerConfig
+ids, dists = index.search(q, k=10)
+```
+
+| preset | quantizer | size vs float32 | recall@10 on dbpedia-1536 | use when |
+|---|---|---|---:|---|
+| `compact` | RaBitQ 1 bit (FastScan above dim 256) | ~32× smaller | 0.83 | memory is the limit; re-rank a larger k |
+| `balanced` (default) | TurboQuant 4 bit, FastScan | ~8× smaller | 0.97 | general use: fastest search at every measured dim |
+| `accurate` | RaBitQ 8 bit, flat scan | ~4× smaller | 0.999 | recall matters more than speed |
+
+`vsq.preset(name, dim)` returns the `QuantizerConfig`; presets are entries of
+the autotune catalog, so `autotune(..., candidates=["balanced", "accurate"])`
+compares just those and the report names the preset it chose. Evidence:
+[Defaults and presets](docs/benchmarks.md#defaults-and-presets).
 
 ---
 

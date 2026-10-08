@@ -42,7 +42,7 @@ datasets, 500 queries):
 | quantizer | configuration | knobs that were swept and lost |
 |---|---|---|
 | TurboQuant | `TurboQuantSpace(dim, bits)` + `train(base)`: IVF centering, 256 k-means centroids, `estimator="corrected"`, no QJL | `qjl=True` (−0.01…−0.06 recall@10 at 4 bits), `estimator="plain"`, `centering="mean"/"none"` (dbpedia 4-bit: 0.970 / 0.944 vs 0.974), `rotation_rounds` 1/5 (noise) |
-| RaBitQ | `RaBitQSpace(dim, bits=b)` + `train(base)`: centroid = base mean, `encode_mode` default (`windowed_scale` at 4/8 bits), float query at 1 bit (`query_bits=0`) | zero centroid (dbpedia: 1-bit 0.66, 4-bit 0.938, 8-bit 0.990), `fixed_scale`/`trained_scale` at 8 bits, `query_bits=4` at 1 bit (−0.01…−0.02), `rotation="legacy"` (noise) |
+| RaBitQ | `RaBitQSpace(dim, bits=b)` + `train(base)`: centroid = base mean, `encode_mode="windowed_scale"` (the 4/8-bit default of this run; since then 4 bits default to `fixed_scale`, see [Defaults and presets](#defaults-and-presets)), float query at 1 bit (`query_bits=0`) | zero centroid (dbpedia: 1-bit 0.66, 4-bit 0.938, 8-bit 0.990), `fixed_scale`/`trained_scale` at 8 bits, `query_bits=4` at 1 bit (−0.01…−0.02), `rotation="legacy"` (noise) |
 | TurboQuant FastScan | `TurboQuantFastScan(space, codes).search(q, k, rerank=4)` | `rerank=1` (dbpedia 0.968 vs 0.974); `rerank ≥ 2` already equals the flat scan |
 | RaBitQ FastScan | `RaBitQFastScan(space, X, eps0=1.9).search(q, k)` on the trained space | `eps0=3.0` refines more codes for ≤ +0.005 recall@10 |
 
@@ -51,6 +51,33 @@ The other RaBitQ rows pin the remaining encode modes for comparison:
 `rabitq-algorithm1` (the exact reference). See
 [RaBitQ encode modes](../README.md#encode-modes-4-and-8-bits) for what each
 one does.
+
+### Defaults and presets
+
+The library defaults and the named presets were set from this run
+(recall@10 over 500 queries; encode rate in vectors/s, 1 thread). Before
+2026-10-08 `RaBitQSpace` defaulted to 1 bit and `windowed_scale` at 4 bits.
+
+| decision | evidence (gauss128 / gauss768 / gauss1024 / dbpedia-1536) |
+|---|---|
+| `RaBitQSpace(dim)` defaults to `bits=4` (was 1), like `TurboQuantSpace` | recall@10 at 1 bit 0.258 / 0.277 / 0.297 / 0.830 vs 0.859 / 0.861 / 0.861 / 0.969 at 4 bits — 1 bit is a specialist choice, not a default |
+| 4-bit `encode_mode` defaults to `fixed_scale` (was `windowed_scale`) | recall@10 fixed vs windowed 0.8586 / 0.8586, 0.8614 / 0.8566, 0.8606 / 0.8596, 0.9694 / 0.9684 (differences ≤ 0.005, below the 95 % half-width 0.005–0.010 of 5000 query·neighbour pairs); encode 1.08 M vs 119 k, 160 k vs 15 k, 128 k vs 11 k, 74 k vs 6.6 k — 9–11× faster |
+| 8-bit keeps `windowed_scale` | fixed loses 0.9740 vs 0.9898, 0.9814 vs 0.9854, 0.9846 vs 0.9872, 0.9984 vs 0.9990 |
+| TurboQuant defaults unchanged | 4 bits, IVF-256, `corrected`, no QJL already win the sweep above |
+
+Presets (`vsq.preset`, `vsq.build_index`) are fixed points of the same data,
+for building without calibration:
+
+| preset | configuration | bytes/vector at dim 1536 | recall@10 dbpedia / N(0,1) | search, M codes/s at dim 1536 / 128 |
+|---|---|---:|---:|---:|
+| `compact` | RaBitQ 1 bit, float query; FastScan at dim > 256, flat below | 200 | 0.830 / 0.26–0.30 | 19.2 / 80.8 (flat) |
+| `balanced` (default) | TurboQuant 4 bit, FastScan, `rerank=2` | 782 | 0.974 / 0.87 | 27.1 / 209 |
+| `accurate` | RaBitQ 8 bit, flat scan, `windowed_scale` | 1544 | 0.999 / 0.985–0.990 | 6.0 / 90.7 |
+
+`balanced` is the fastest search at every measured dim and was
+`vsq.autotune(profile="speed")`'s choice in all six validation runs.
+`accurate` uses the flat scan: RaBitQ 8-bit FastScan is 3× faster at dim
+1536 but loses 0.004–0.011 recall@10.
 
 ### Accuracy vs code size
 

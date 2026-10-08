@@ -29,6 +29,16 @@ def _table(rows: list[tuple[str, ...]]) -> list[str]:
     return [fmt(rows[0]), "  ".join("-" * w for w in widths)] + [fmt(r) for r in rows[1:]]
 
 
+def _chosen_label(result) -> str:
+    """'tq4-fs (preset "balanced")', the bare id, or 'none'."""
+    if result.chosen is None:
+        return "none"
+    from .presets import preset_name
+
+    name = preset_name(result.chosen, result.data.dim)
+    return result.chosen.name + (f' (preset "{name}")' if name else "")
+
+
 def format_report(result) -> str:
     """Header, candidate table (* = chosen), rule trace, reasons, caveats."""
     c, d, h = result.constraints, result.data, result.host
@@ -52,7 +62,7 @@ def format_report(result) -> str:
                                           for cand in not_measured]
     if result.rule_trace:
         lines += ["", "rules:"] + [f"  {t}" for t in result.rule_trace]
-    lines += ["", f"chosen: {result.chosen.name if result.chosen else 'none'}"]
+    lines += ["", f"chosen: {_chosen_label(result)}"]
     lines += [f"  {w}" for w in result.why]
     sampled = d.n_base_sample < d.n_full
     caveats = [

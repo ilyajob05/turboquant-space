@@ -1,4 +1,5 @@
-"""``vsq.autotune``: choose and build the best quantizer for data + profile."""
+"""Public entry points: ``vsq.autotune`` (measure, choose, build) and
+``vsq.build_index`` (build a preset or a given configuration, no calibration)."""
 
 from __future__ import annotations
 
@@ -9,8 +10,10 @@ from .calibrate import Options, calibrate, prepare
 from .candidates import CandidatePlan, exact_code_size, generate_candidates
 from .energy import EnergyModel, default_energy_model
 from .host import probe_host
-from .index import build_index
+from .index import QuantizedIndex
+from .index import build_index as _build_index
 from .metrics import as_matrix
+from .presets import DEFAULT_PRESET, PRESETS, preset
 from .result import AutotuneResult
 from .select import AutotuneInfeasibleError, select
 from .timing import Clock, RealClock
@@ -18,6 +21,36 @@ from .types import PROFILES, Constraints, QuantizerConfig
 
 _MIN_ROWS = 1000
 _MAX_K = 100
+
+
+def build_index(X, config: str | QuantizerConfig = DEFAULT_PRESET, *,
+                num_threads: int | None = None) -> QuantizedIndex:
+    """Build a searchable index on X without calibration.
+
+    Args:
+      X: (n, dim) float vectors, n >= 1; converted once to C-contiguous float32.
+      config: a preset name ("compact", "balanced", "accurate"; see
+        ``vsq.PRESETS``) or a QuantizerConfig, e.g. ``AutotuneResult.chosen``.
+      num_threads: overrides the configuration's thread count (>= 1).
+
+    Returns: QuantizedIndex; ``search(q, k)`` -> (ids (k,) uint32, dists (k,) float32).
+    Raises: ValueError for an unknown preset, bad X or num_threads; TypeError
+      when config is neither a string nor a QuantizerConfig.
+    """
+    X = as_matrix(X, "X")
+    resolved = _resolve(config, X.shape[1])
+    if num_threads is not None:
+        resolved = resolved.with_threads(num_threads)
+    return _build_index(resolved, X)[0]
+
+
+def _resolve(config: str | QuantizerConfig, dim: int) -> QuantizerConfig:
+    """Preset name or QuantizerConfig -> QuantizerConfig for vectors of ``dim``."""
+    if isinstance(config, str):
+        return preset(config, dim)
+    if isinstance(config, QuantizerConfig):
+        return config
+    raise TypeError(f"config must be a preset name or a QuantizerConfig, got {type(config).__name__}")
 
 
 def autotune(
@@ -35,7 +68,7 @@ def autotune(
     seed: int = 0,
     build: bool = True,
     energy_model: EnergyModel | None = None,
-    candidates: Sequence[QuantizerConfig] | None = None,
+    candidates: Sequence[str | QuantizerConfig] | None = None,
     clock: Clock | None = None,
     options: Options | None = None,
 ) -> AutotuneResult:
@@ -59,7 +92,9 @@ def autotune(
       build: also build the chosen index on all of X into ``result.index``.
       energy_model: proxy coefficients (default: uncalibrated placeholders
         for this machine class).
-      candidates: expert override; skips the rules and the escalation ladder.
+      candidates: expert override, QuantizerConfigs and/or preset names
+        (e.g. ["balanced", "accurate"]); skips the rules and the escalation
+        ladder.
       clock, options: timing clock and calibration knobs (tests / experts).
 
     Returns: AutotuneResult (``chosen``, every measurement, ``report()``,
@@ -79,7 +114,8 @@ def autotune(
     need = max(_MIN_ROWS, held_out + 10 * k)
     if X.shape[0] < need:
         raise ValueError(f"autotune needs n >= {need} rows (got {X.shape[0]}); for smaller "
-                         "data build a QuantizerConfig directly")
+                         f"data use vsq.build_index(X, preset) with a preset of "
+                         f"{sorted(PRESETS)}")
     constraints = Constraints.for_profile(
         profile, min_recall=min_recall, max_bytes_per_vector=max_bytes_per_vector,
         max_latency_ms=max_latency_ms, time_budget_s=time_budget_s)
@@ -89,7 +125,7 @@ def autotune(
 
     cset = prepare(X, queries, k=k, n_sample=n_sample, n_queries=n_queries, seed=seed)
     if candidates is not None:
-        configs = tuple(candidates)
+        configs = tuple(_resolve(c, X.shape[1]) for c in candidates)
         if not configs:
             raise ValueError("candidates must not be empty")
         plan = CandidatePlan((configs,), ("expert candidate list: rules and escalation skipped",))
@@ -116,5 +152,5 @@ def autotune(
         raise
     result = make(chosen, why)
     if build:
-        result = replace(result, index=build_index(chosen, X)[0])
+        result = replace(result, index=_build_index(chosen, X)[0])
     return result

@@ -36,22 +36,27 @@ def test_legacy_rotation_keeps_pow2_padding():
     assert RaBitQSpace(1536, rotation="legacy").padded_dim() == 2048
 
 
-def test_one_bit_default_uses_quantized_query():
+def test_default_is_four_bit_fixed_scale_float_query():
     space = RaBitQSpace(256)
+    assert (space.bits(), space.encode_mode(), space.query_bits()) == (4, "fixed_scale", 0)
+
+
+def test_one_bit_default_uses_quantized_query():
+    space = RaBitQSpace(256, bits=1)
     assert space.query_bits() == 4
     assert space.distance_kernel() == "1-" + detected_isa() + "-q4"
     assert RaBitQSpace(256, bits=4).query_bits() == 0
-    assert RaBitQSpace(256, query_bits=0).distance_kernel() == "1-" + detected_isa()
+    assert RaBitQSpace(256, bits=1, query_bits=0).distance_kernel() == "1-" + detected_isa()
 
 
 def test_query_bits_validation():
     with pytest.raises(ValueError):
         RaBitQSpace(64, bits=4, query_bits=4)
     with pytest.raises(ValueError):
-        RaBitQSpace(64, query_bits=9)
+        RaBitQSpace(64, bits=1, query_bits=9)
     with pytest.raises(ValueError):
-        RaBitQSpace(16, rotation="legacy", query_bits=4)  # D = 16 is not a multiple of 64
-    assert RaBitQSpace(16, rotation="legacy").query_bits() == 0  # the default falls back
+        RaBitQSpace(16, bits=1, rotation="legacy", query_bits=4)  # D = 16 is not a multiple of 64
+    assert RaBitQSpace(16, bits=1, rotation="legacy").query_bits() == 0  # the default falls back
 
 
 @pytest.mark.parametrize("bits,tol", [(1, 0.08), (4, 0.012), (8, 0.002)])
@@ -67,8 +72,8 @@ def test_quantized_query_is_close_to_float_query():
     dim = 512
     X = gaussian(500, dim, seed=3)
     Q = gaussian(5, dim, seed=4)
-    q4 = RaBitQSpace(dim, query_bits=4)
-    qf = RaBitQSpace(dim, query_bits=0)
+    q4 = RaBitQSpace(dim, bits=1, query_bits=4)
+    qf = RaBitQSpace(dim, bits=1, query_bits=0)
     codes = q4.encode_batch(X)
     np.testing.assert_array_equal(codes, qf.encode_batch(X))  # same code, different query
     assert rel_rms(q4.distance_m_to_n(Q, codes), qf.distance_m_to_n(Q, codes)) < 0.03

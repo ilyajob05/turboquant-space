@@ -76,12 +76,13 @@ _FASTSCAN_FAMILIES = ("turboquant-fastscan", "rabitq-fastscan")
 _MAX_TRAIN_ROWS = 65536  # TurboQuant k-means sample cap
 
 # Default grid. Bare `rabitq` / `rabitq-fastscan` use the library default
-# encode mode (windowed_scale at 4/8 bits, the most accurate per encode
-# cost); the other RaBitQ tokens pin the static, trained and exact modes.
+# encode mode (fixed_scale at 4 bits, windowed_scale at 8, the most accurate
+# per encode cost); the other RaBitQ tokens pin the remaining modes, so the
+# non-default mode at each width (windowed 4, fixed 8) stays in the grid.
 _DEFAULT_METHODS = (
     "turboquant:4,turboquant:8,turboquant-fastscan:4,"
     "rabitq:1,rabitq:4,rabitq:8,"
-    "rabitq-fixed-scale:4,rabitq-fixed-scale:8,"
+    "rabitq-windowed-scale:4,rabitq-fixed-scale:8,"
     "rabitq-trained-scale:4,rabitq-trained-scale:8,"
     "rabitq-algorithm1:4,rabitq-algorithm1:8,"
     "rabitq-fastscan:1,rabitq-fastscan:4,rabitq-fastscan:8"
@@ -202,7 +203,7 @@ def parse_methods(text: str) -> list[MethodSpec]:
             raise ValueError(
                 f"{family} bits must be one of {legal}, got {bits}"
             )
-        # None = the library default (algorithm1 at 1 bit, windowed_scale at 4/8).
+        # None = the library default (algorithm1 / fixed_scale / windowed_scale at 1 / 4 / 8).
         if encode_mode not in (None, "algorithm1") and bits == 1:
             raise ValueError(f"{report_name} requires bits 4 or 8, got 1")
         specs.append(MethodSpec(report_name, bits, encode_mode))
@@ -703,7 +704,7 @@ def write_markdown(path: Path, rows: list[dict], stamp: str, host: str, cfg: Run
             "centroids fitted on the base, corrected estimator, no QJL). RaBitQ uses "
             f"centroid={cfg.rabitq_centroid} (`train()` on the base), {query_bits} queries for "
             "1-bit codes, and bare `rabitq` keeps the library default encode mode "
-            "(`windowed_scale` at 4/8 bits). "
+            "(`fixed_scale` at 4 bits, `windowed_scale` at 8). "
             f"`turboquant-fastscan` re-scores k·{cfg.rerank} candidates; `rabitq-fastscan` uses "
             f"eps0={cfg.eps0:g}."
         ),

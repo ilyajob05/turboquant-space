@@ -15,6 +15,20 @@ saved = result.to_json()                    # reuse later without re-calibrating
 index = vsq.AutotuneResult.from_json(saved).build(X)
 ```
 
+## Autotune or a preset?
+
+| you have | use | cost |
+|---|---|---|
+| ≥ 1000 vectors and an objective (recall, latency, energy, memory) | `vsq.autotune(X, profile, ...)` | 10–90 s of calibration |
+| a known trade-off, or fewer than 1000 vectors | `vsq.build_index(X, "compact" \| "balanced" \| "accurate")` | build only |
+| a stored choice | `vsq.build_index(X, result.chosen)` or `AutotuneResult.from_json(s).build(X)` | build only |
+
+Presets are fixed entries of the candidate catalog below (`compact` =
+`rq1-fs`, or `rq1-flat` at dim ≤ 256; `balanced` = `tq4-fs`; `accurate` =
+`rq8-flat`); the report marks a choice that equals one, e.g.
+`chosen: tq4-fs (preset "balanced")`. Their measured trade-offs are in
+[Defaults and presets](benchmarks.md#defaults-and-presets).
+
 ## Profiles
 
 | profile | objective | default constraints | time budget |
@@ -55,9 +69,10 @@ Ties are broken deterministically:
 | `seed` | int | 0 | seeds the split; equal seeds give equal recall measurements |
 | `build` | bool | True | also build the chosen index on all of X (`result.index`) |
 | `energy_model` | `EnergyModel` or None | per machine class | proxy coefficients |
-| `candidates` | list of `QuantizerConfig` or None | None | expert override: skips the rules and the escalation ladder |
+| `candidates` | list of `QuantizerConfig` and/or preset names, or None | None | expert override: measures exactly these (e.g. `["balanced", "accurate"]`), skipping the rules and the escalation ladder |
 
-`ValueError` is raised for invalid arguments; `AutotuneInfeasibleError` (a
+`ValueError` is raised for invalid arguments (fewer than 1000 rows: use a
+preset); `AutotuneInfeasibleError` (a
 `ValueError`) when no candidate meets every constraint. Its message lists the
 best achievable value per constraint and what relaxing each one would admit,
 and its `.result` carries all measurements.
@@ -81,7 +96,7 @@ and its `.result` carries all measurements.
 TurboQuant runs its defaults (IVF centering with 256 k-means centroids,
 corrected estimator, no QJL — QJL never won at equal storage). RaBitQ runs
 `train()` (centroid = mean of the data, the largest accuracy factor on real
-embeddings) and its default `windowed_scale` encode mode. A `-tN` suffix
+embeddings) and its default encode mode (`fixed_scale` at 4 bits, `windowed_scale` at 8). A `-tN` suffix
 (`rq4-flat-t4`) is the same entry with N OpenMP threads.
 
 ### 2. Rules (no recall prediction)

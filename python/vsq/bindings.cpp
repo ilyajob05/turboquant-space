@@ -360,8 +360,8 @@ void bindRaBitQ(py::module_ &m) {
     cls.def(py::init([](size_t dim, uint64_t rot_seed, py::object centroid, int bits,
                         py::object encode_mode, const std::string &rotation, int rotation_rounds,
                         py::object query_bits, int num_threads, const std::string &isa) {
-                // None is the C++ sentinel -1: 1-bit -> algorithm1,
-                // 4/8-bit -> RaBitQSpace::kDefaultEncodeMode. A string selects the mode.
+                // None is the C++ sentinel -1, resolved by
+                // RaBitQSpace::defaultEncodeMode(bits). A string selects the mode.
                 int mode = -1;
                 if (!encode_mode.is_none()) {
                     const std::string name = py::cast<std::string>(encode_mode);
@@ -382,7 +382,7 @@ void bindRaBitQ(py::module_ &m) {
                                    rotation_rounds, qbits, num_threads, parseIsa(isa));
             }),
             py::arg("dim"), py::arg("rot_seed") = 42, py::arg("centroid") = py::none(),
-            py::arg("bits") = 1, py::arg("encode_mode") = py::none(), py::kw_only(),
+            py::arg("bits") = RaBitQSpace::kDefaultBits, py::arg("encode_mode") = py::none(), py::kw_only(),
             py::arg("rotation") = "kac", py::arg("rotation_rounds") = 3,
             py::arg("query_bits") = py::none(), py::arg("num_threads") = 0, py::arg("isa") = "auto")
         .def("encode_mode", &RaBitQSpace::encodeModeName)

@@ -49,8 +49,8 @@ _REQUIRED = {
 }
 
 # One colour and marker per method, so every panel reads the same way.
-# Bare `rabitq` is the library default: windowed_scale at 4/8 bits, the sign
-# code at 1 bit.
+# Bare `rabitq` is the library default: the sign code at 1 bit, fixed_scale at
+# 4 bits, windowed_scale at 8.
 _STYLE = {
     "turboquant": ("#1f77b4", "o"),
     "rabitq": ("#d62728", "s"),

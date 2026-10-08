@@ -5,7 +5,7 @@
 // Asymmetric squared L2 (prepared query x code). Not a code-to-code score,
 // so it must not be used as the HNSW link-construction metric.
 //
-// bits is 1, 4, or 8. Coordinates [dim, D) are 0 before the rotation.
+// bits is 1, 4 (default), or 8. Coordinates [dim, D) are 0 before the rotation.
 // Rotation (rotation.h):
 //   BlockKac (default)  D = dim rounded up to a multiple of 64, 3 rounds of
 //                       signs + overlapping Walsh–Hadamard blocks + Kac step
@@ -47,19 +47,24 @@
 // 4/8-bit encode_mode: how the grid scale t (codes = round(t * o') clamped
 // to the grid) is chosen. All modes write the same slot and use the same
 // distance kernel; they differ only in encode cost and code quality. The
-// constructor default is -1, resolved from bits: 1-bit is algorithm1 (the
-// sign code has no scale); 4-bit and 8-bit use kDefaultEncodeMode =
-// windowed_scale, the most accurate mode per unit of encode cost.
+// constructor default is -1, resolved by defaultEncodeMode(bits), the most
+// accurate mode per unit of encode cost measured on N(0,1) at dim
+// 128/768/1024 and dbpedia-1536 (docs/benchmarks.md, 2026-10-06):
+//   1-bit  algorithm1      the sign code has no scale
+//   4-bit  fixed_scale     recall@10 equal to windowed_scale within noise
+//                          (|diff| <= 0.005), ~10x faster encode
+//   8-bit  windowed_scale  fixed_scale loses 0.001-0.015 recall@10 here
 //   0 algorithm1      per vector, sort every threshold. Bit-exact Extended
 //                     RaBitQ Algorithm 1; O(D log D). Reference accuracy.
 //   1 fixed_scale     static: one t frozen for the whole space, O(1) per
 //                     coordinate. t is the mean Algorithm 1 plateau edge
 //                     over 100 N(0,1) residuals at seed 42 (not rot_seed).
 //                     Fastest encode; at 8 bits recall is lower.
+//                     The 4-bit default.
 //   2 windowed_scale  per vector, inside the RaBitQ-Library tight interval,
 //                     chosen by a min-heap of the next magnitude event.
 //                     Same accuracy as algorithm1, several times faster.
-//                     The 4/8-bit default.
+//                     The 8-bit default.
 //   3 trained_scale   like fixed_scale, but t is calibrated by train(X) on
 //                     the residuals x - c of the data itself. encode before
 //                     train() throws. After the random rotation residual
@@ -104,10 +109,14 @@ public:
     using DistFunc = float (*)(const void *, const void *, const void *);
     static constexpr float kDefaultEps0 = 1.9f;  // RaBitQ confidence constant
 
-    // Encode modes (see the file header). -1 resolves from bits: 1-bit ->
-    // Algorithm1, 4/8-bit -> kDefaultEncodeMode.
+    // Encode modes (see the file header). -1 resolves to defaultEncodeMode(bits).
     enum EncodeMode : int { Algorithm1 = 0, FixedScale = 1, WindowedScale = 2, TrainedScale = 3 };
-    static constexpr int kDefaultEncodeMode = WindowedScale;
+    static constexpr int kDefaultBits = 4;
+
+    // Default encode mode for a bit width in {1, 4, 8} (see the file header).
+    static constexpr int defaultEncodeMode(int bits) {
+        return bits == 1 ? Algorithm1 : (bits == 4 ? FixedScale : WindowedScale);
+    }
     // Rows of X used by train() to calibrate trained_scale (even stride).
     static constexpr size_t kTrainCalibRows = 1024;
 
@@ -117,7 +126,7 @@ public:
     // windowed_scale, trained_scale (needs train() before encode).
     // query_bits -1: default (1-bit: 4, the paper's B_q; 4/8-bit: 0 = float
     // query). 1-bit accepts 0..8; 4/8-bit accept 0 only.
-    RaBitQSpace(size_t dim, uint64_t rot_seed, const float *centroid, int bits = 1,
+    RaBitQSpace(size_t dim, uint64_t rot_seed, const float *centroid, int bits = kDefaultBits,
                 int encode_mode = -1, common::RotationKind rotation = common::RotationKind::BlockKac,
                 int rotation_rounds = 3, int query_bits = -1, int num_threads = 0,
                 common::Isa isa = common::detectIsa())
@@ -139,7 +148,7 @@ public:
             throw std::invalid_argument(
                 "RaBitQ: encode_mode must be -1, 0, 1, 2, or 3");
         if (encode_mode_ < 0)
-            encode_mode_ = bits_ == 1 ? Algorithm1 : kDefaultEncodeMode;
+            encode_mode_ = defaultEncodeMode(bits_);
         if (encode_mode_ != Algorithm1 && bits_ == 1)
             throw std::invalid_argument(
                 "RaBitQ: fixed_scale, windowed_scale and trained_scale require bits 4 or 8");
